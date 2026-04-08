@@ -22,12 +22,12 @@ def get_args():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--base_model', '-m', default='SITR_base', help='From "SITR_base"')
-    parser.add_argument('--load', '-f', type=str, default='checkpoints/classification/', help='Load model from a folder')
+    parser.add_argument('--load', '-f', type=str, default='datasets/checkpoints/classification/', help='Load model from a folder')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=16, help='Batch size')
     parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--calibration-config', dest='cc', default=18, type=int, help='From 0, 4, 8, 9, 18')
     parser.add_argument('--device', '-d', default='cuda:0', help='Device to train on')
-    parser.add_argument('--val-path', type=str, default='classification_dataset/val_set', help='Validation set path')
+    parser.add_argument('--val-path', type=str, default='datasets/classification_dataset/val_set', help='Validation set path')
     return parser.parse_args()
 
 def evaluate(net, dataset, args):
@@ -129,3 +129,11 @@ if __name__ == '__main__':
     # Generate confusion matrices for different sensor groups
     confusion_across_sensor([0,1,2,3], net, args, output_file='class_confusion_matrix_inter.png')
     confusion_across_sensor([0,4,5,6], net, args, output_file='class_confusion_matrix_intra.png')
+
+'''
+python plot_classifier.py \
+    --load /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls_16 \
+    --val-path /media/hdd/ihsuan/gsrl/datasets/classification_dataset/val_set \
+    --device cuda:2 \
+    2>&1 | tee /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls/plot.log
+'''

@@ -163,6 +163,8 @@ cython_debug/
 
 # Project-specific data and model files
 checkpoints/
+datasets/
+sensor_0000/
 classification_dataset/
 renders/
 pose_dataset/
@@ -176,6 +178,5 @@ pose_dataset/
 *.pkl
 *.pickle
 *.json
-*.csv
 *.log
 training.log

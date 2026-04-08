@@ -21,12 +21,12 @@ def get_args():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--base_model', '-m', default='SITR_base', help='From "SITR_base"')
-    parser.add_argument('--load', '-f', type=str, default='checkpoints/pose_estimation/', help='Load model from a .pth file')
+    parser.add_argument('--load', '-f', type=str, default='datasets/checkpoints/pose_estimation/', help='Load model from a .pth file')
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=32, help='Batch size')
     parser.add_argument('--amp', action='store_true', default=True, help='Use mixed precision')
     parser.add_argument('--calibration-config', dest='cc', default=18, type=int, help='From 0, 4, 8, 9, 18')
     parser.add_argument('--device', '-d', default='cuda:0', help='Device to train on')
-    parser.add_argument('--val-path', type=str, default='pose_dataset/val_set', help='Validation set path')
+    parser.add_argument('--val-path', type=str, default='datasets/pose_dataset/val_set', help='Validation set path')
     return parser.parse_args()
 
 def evaluate(net, dataset, args):
