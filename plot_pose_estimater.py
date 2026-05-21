@@ -91,8 +91,14 @@ def confusion_across_sensor(list_of_sensor, net, args, output_file):
     # Evaluate model performance across all sensor combinations
     for i, sensor in enumerate(list_of_sensor):
         # Load weights with proper device mapping
-        weights_path = os.path.join(args.load, args.base_model, f'sensor_000{sensor}.pth')
-        weights = torch.load(weights_path, map_location=device)
+        # weights_path = os.path.join(args.load, args.base_model, f'sensor_000{sensor}.pth')
+        weights_path = os.path.join(
+            args.load,
+            f'sensor_000{sensor}',
+            'best.pth'
+        )
+        # weights = torch.load(weights_path, map_location=device)
+        weights = torch.load(weights_path, map_location=device)['model']
         net.load_state_dict(weights)
         net.to(device)  # Ensure model is on correct device
         
@@ -138,3 +144,10 @@ if __name__ == '__main__':
     
     # Generate confusion matrix for the first group of sensors
     confusion_across_sensor([0,1,2,3], net, args, output_file='pos_confusion_matrix_inter.png')
+
+'''
+python /media/hdd/ihsuan/gsrl/plot_pose_estimater.py \
+    --load /media/hdd/ihsuan/gsrl/output_checkpoints/pose_estimation \
+    --device cuda:0 \
+    --batch-size 32
+'''

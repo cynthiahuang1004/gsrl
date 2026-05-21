@@ -3,27 +3,25 @@ train_sitr_finetune.py: DDP 版，支援多 GPU 訓練
 
 Usage (2 GPU: cuda:0 and cuda:3)
 -----
-torchrun --nproc_per_node=2 --master_port=29503 train_sitr_finetune.py --data-path /media/hdd/ihsuan/gsrl/datasets/renders --pretrain-weights /media/hdd/ihsuan/gsrl/datasets/checkpoints/SITR_B18.pth --save-path output_checkpoints/sitr_finetune --lr 1e-5 --epochs 10 --gpu-ids 1 3 --num-workers 4 --num-samples 3000 2>&1 | tee train.log
+CUDA_VISIBLE_DEVICES=1,3 torchrun --nproc_per_node=2 --master_port=29503 train_sitr_finetune.py --data-path /media/hdd/ihsuan/gsrl/datasets/renders --pretrain-weights /media/hdd/ihsuan/gsrl/datasets/checkpoints/SITR_B18.pth --save-path output_checkpoints/sitr_finetune --lr 1e-5 --epochs 10 --num-workers 4 --num-samples 3000 2>&1 | tee train.log
 
-torchrun --nproc_per_node=2 --master_port=29510 train_sitr_finetune.py \
+CUDA_VISIBLE_DEVICES=1,3 torchrun --nproc_per_node=2 --master_port=29510 train_sitr_finetune.py \
     --data-path /media/hdd/ihsuan/gsrl/datasets/renders \
     --pretrain-weights /media/hdd/ihsuan/gsrl/datasets/checkpoints/SITR_B18.pth \
     --save-path output_checkpoints/sitr_finetune_v2 \
     --lr 1e-5 \
     --epochs 10 \
-    --gpu-ids 1 3 \
     --num-workers 4 \
     --num-samples 10000 \
     2>&1 | tee train_v2.log
 
-torchrun --nproc_per_node=2 --master_port=29511 train_sitr_finetune.py \
+CUDA_VISIBLE_DEVICES=1,3 torchrun --nproc_per_node=2 --master_port=29511 train_sitr_finetune.py \
     --data-path /media/hdd/ihsuan/gsrl/datasets/renders \
     --pretrain-weights /media/hdd/ihsuan/gsrl/datasets/checkpoints/SITR_B18.pth \
     --save-path output_checkpoints/sitr_finetune_v2 \
     --resume output_checkpoints/sitr_finetune_v2/latest.pth \
     --lr 1e-5 \
     --epochs 10 \
-    --gpu-ids 1 3 \
     --num-workers 4 \
     --num-samples 10000 \
     2>&1 | tee train_resume2.log
@@ -179,18 +177,30 @@ def train_one_epoch(model, loader, optimizer, scaler, normal_criterion,
 
 
 @torch.no_grad()
-def validate(model, loader, normal_criterion, device, amp_enabled):
+def validate(model, loader, normal_criterion, contrastive_criterion,
+             lambda_normal, lambda_scl, device, amp_enabled):
     model.eval()
-    meter = AverageMeter()
+    loss_meter = AverageMeter()
+    norm_meter = AverageMeter()
     for batch in loader:
-        img_a   = batch["sample"][:, 0].to(device, non_blocking=True)
-        calib_a = batch["calibration"][:, 0].to(device, non_blocking=True)
-        norm_a  = batch["norm"][:, 0].to(device, non_blocking=True)
+        img_a   = batch["sample"][:, 0].to(device)
+        img_b   = batch["sample"][:, 1].to(device)
+        calib_a = batch["calibration"][:, 0].to(device)
+        calib_b = batch["calibration"][:, 1].to(device)
+        norm_a  = batch["norm"][:, 0].to(device)
+        norm_b  = batch["norm"][:, 1].to(device)
+        labels  = batch["idx"].to(device)
         with autocast("cuda", enabled=amp_enabled):
-            out  = model(img_a, calib_a)
-            loss = normal_criterion(out["proj"], norm_a)
-        meter.update(loss.item(), img_a.size(0))
-    return meter.avg
+            out_a = model(img_a, calib_a)
+            out_b = model(img_b, calib_b)
+            l_normal = (normal_criterion(out_a["proj"], norm_a) +
+                        normal_criterion(out_b["proj"], norm_b)) * 0.5
+            feats = torch.stack([out_a["cls_token"], out_b["cls_token"]], dim=1)
+            l_scl = contrastive_criterion(feats, labels)
+            loss = lambda_normal * l_normal + lambda_scl * l_scl
+        loss_meter.update(loss.item(), img_a.size(0))
+        norm_meter.update(l_normal.item(), img_a.size(0))
+    return loss_meter.avg, norm_meter.avg
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -335,7 +345,8 @@ def main():
     # DDP 時 lr 按 GPU 數量 scale
     effective_lr = args.lr * (dist.get_world_size() if is_ddp else 1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=effective_lr,
-                                  weight_decay=args.weight_decay, betas=(0.9, 0.999))
+                              weight_decay=0.1,  # 從 0.05 提高
+                              betas=(0.9, 0.999))
     scheduler = get_scheduler(optimizer, args.warmup_epochs, args.epochs,
                                warmup_lr=1e-8, base_lr=effective_lr, min_lr=args.min_lr)
     scaler = GradScaler("cuda", enabled=args.amp)
@@ -395,7 +406,12 @@ def main():
             args.lambda_normal, args.lambda_scl,
             device, args.amp, epoch, is_ddp)
 
-        val_loss = validate(model, val_loader, normal_criterion, device, args.amp)
+        val_loss, val_norm = validate(
+            model, val_loader,
+            normal_criterion, contrastive_criterion,
+            args.lambda_normal, args.lambda_scl,
+            device, args.amp
+        )
         scheduler.step()
 
         # DDP：把各 GPU 的 val_loss 平均
@@ -406,7 +422,7 @@ def main():
 
         if is_main:
             print(f"  → train={train_loss:.4f}  l_norm={l_normal:.4f}"
-                  f"  l_scl={l_scl:.4f}  val={val_loss:.4f}")
+                f"  l_scl={l_scl:.4f}  val={val_loss:.4f}  val_norm={val_norm:.4f}")
 
             history["epochs"].append(epoch)
             history["train_loss"].append(train_loss)

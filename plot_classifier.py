@@ -85,8 +85,10 @@ def confusion_across_sensor(list_of_sensor, net, args, output_file):
     
     # Evaluate model performance across all sensor combinations
     for i, sensor in enumerate(list_of_sensor):
-        weights = torch.load(os.path.join(args.load, args.base_model, f'sensor_000{sensor}.pth'))
-        net.load_state_dict(weights)
+        ckpt_path = os.path.join(args.load, args.base_model, f'sensor_000{sensor}.pth')
+        ckpt = torch.load(ckpt_path, map_location=args.device)
+        net.load_state_dict(ckpt) 
+        
         for j, sensor2 in enumerate(list_of_sensor):
             print(f'Evaluating: Sensor {sensor} → Sensor {sensor2}')
             dataset = classification_dataset(
@@ -132,8 +134,7 @@ if __name__ == '__main__':
 
 '''
 python plot_classifier.py \
-    --load /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls_16 \
+    --load /media/hdd/ihsuan/gsrl/datasets/checkpoints/classification \
     --val-path /media/hdd/ihsuan/gsrl/datasets/classification_dataset/val_set \
     --device cuda:2 \
-    2>&1 | tee /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls/plot.log
 '''

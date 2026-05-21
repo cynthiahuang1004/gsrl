@@ -168,8 +168,8 @@ sensor_0000/
 classification_dataset/
 renders/
 pose_dataset/
-*.pth
 *.pt
+*.pth
 *.ckpt
 *.h5
 *.hdf5
@@ -177,6 +177,5 @@ pose_dataset/
 *.npz
 *.pkl
 *.pickle
-*.json
 *.log
 training.log

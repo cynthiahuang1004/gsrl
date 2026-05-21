@@ -14,29 +14,32 @@ Usage (classification)
 ----------------------
 python train_downstream.py \
     --task classification \
-    --encoder-weights /media/hdd/ihsuan/gsrl/output_checkpoints/sitr_finetune/sitr_encoder.pth \
+    --encoder-weights /media/hdd/ihsuan/gsrl/output_checkpoints/sitr_finetune_v2/sitr_encoder.pth \
     --data-path /media/hdd/ihsuan/gsrl/datasets/classification_dataset/train_set \
     --val-path  /media/hdd/ihsuan/gsrl/datasets/classification_dataset/val_set \
-    --save-path /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls \
-    --train-sensor 0 \
-    --num-classes 20 \
-    --epochs 1 \
+    --save-path /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls2 \
+    --class-list 0 2 3 4 5 7 8 9 10 11 13 14 15 16 17 18 \
+    --train-sensor 6\
+    --num-classes 16 \
+    --epochs 40 \
     --batch-size 64 \
-    --device cuda:2
+    --device cuda:3 \
+    2>&1 | tee /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls2/train_sensor${sensor}.log
 
 for sensor in 0 1 2 3 4 5 6; do
     python train_downstream.py \
         --task classification \
-        --encoder-weights /media/hdd/ihsuan/gsrl/output_checkpoints/sitr_finetune/sitr_encoder.pth \
+        --encoder-weights /media/hdd/ihsuan/gsrl/output_checkpoints/sitr_finetune_v2/sitr_encoder.pth \
         --data-path /media/hdd/ihsuan/gsrl/datasets/classification_dataset/train_set \
         --val-path  /media/hdd/ihsuan/gsrl/datasets/classification_dataset/val_set \
-        --save-path /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls \
+        --save-path /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls2 \
+        --class-list 0 2 3 4 5 7 8 9 10 11 13 14 15 16 17 18 \
         --train-sensor $sensor \
-        --num-classes 20 \
-        --epochs 50 \
+        --num-classes 16 \
+        --epochs 40 \
         --batch-size 64 \
-        --device cuda:0 \
-        2>&1 | tee /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls/train_sensor${sensor}.log
+        --device cuda:1 \
+        2>&1 | tee /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls2/train_sensor${sensor}.log
 done
 
 Usage (pose estimation)
@@ -47,10 +50,10 @@ python train_downstream.py \
     --data-path /media/hdd/ihsuan/gsrl/datasets/pose_dataset/train_set \
     --val-path  /media/hdd/ihsuan/gsrl/datasets/pose_dataset/val_set \
     --save-path /media/hdd/ihsuan/gsrl/output_checkpoints/pose_estimation \
-    --train-sensor 0 \
-    --epochs 1 \
+    --train-sensor 3 \
+    --epochs 10 \
     --batch-size 32 \
-    --device cuda:2
+    --device cuda:0
 """
 
 import argparse
@@ -324,7 +327,7 @@ def main():
         )
         val_ds = pose_dataset(
             path=args.val_path,
-            sensor_list=[0, 1, 2, 3, 4, 5, 6],
+            sensor_list=[0, 1, 2, 3],
             random_final=False,
             augment=False,
         )
@@ -452,20 +455,3 @@ if __name__ == "__main__":
     main()
 
 
-'''
-for sensor in 6; do
-    python train_downstream.py \
-        --task classification \
-        --encoder-weights /media/hdd/ihsuan/gsrl/output_checkpoints/sitr_finetune/sitr_encoder.pth \
-        --data-path /media/hdd/ihsuan/gsrl/datasets/classification_dataset/train_set \
-        --val-path  /media/hdd/ihsuan/gsrl/datasets/classification_dataset/val_set \
-        --save-path /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls_16 \
-        --train-sensor $sensor \
-        --num-classes 16 \
-        --class-list 0 2 3 4 5 7 8 9 10 11 13 14 15 16 17 18 \
-        --epochs 40 \
-        --batch-size 64 \
-        --device cuda:2 \
-        2>&1 | tee /media/hdd/ihsuan/gsrl/output_checkpoints/downstream_cls_16/train_sensor${sensor}.log
-done
-'''
