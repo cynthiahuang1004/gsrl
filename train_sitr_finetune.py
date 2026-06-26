@@ -49,9 +49,12 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from tqdm import tqdm
 
-from dataloaders import sim_dataset
+from dataloaders import (sim_dataset, sim_dataset_nested,
+                         sample_mu, sample_std, norm_mu, norm_std,
+                         raw_mu, raw_std)
 from models.networks import SITR_base
 from models.losses import SupConLoss
+import torchvision.transforms as T
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -80,6 +83,46 @@ def get_scheduler(optimizer, warmup_epochs, total_epochs,
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return (min_lr + (base_lr - min_lr) * cosine) / base_lr
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+class WarmupThenPlateau:
+    """Warmup LR linearly, then switch to ReduceLROnPlateau."""
+
+    def __init__(self, optimizer, warmup_epochs, warmup_lr, base_lr,
+                 factor=0.5, plateau_patience=10, min_lr=1e-7):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.warmup_lr = warmup_lr
+        self.base_lr = base_lr
+        self.plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=factor,
+            patience=plateau_patience, min_lr=min_lr, verbose=True,
+        )
+        self._epoch = 0
+        self._set_lr(warmup_lr)
+
+    def _set_lr(self, lr):
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+
+    def get_last_lr(self):
+        return [pg["lr"] for pg in self.optimizer.param_groups]
+
+    def step(self, val_loss=None):
+        self._epoch += 1
+        if self._epoch <= self.warmup_epochs:
+            frac = self._epoch / max(1, self.warmup_epochs)
+            lr = self.warmup_lr + (self.base_lr - self.warmup_lr) * frac
+            self._set_lr(lr)
+        else:
+            self.plateau.step(val_loss)
+
+    def state_dict(self):
+        return {"epoch": self._epoch, "plateau": self.plateau.state_dict()}
+
+    def load_state_dict(self, d):
+        self._epoch = d["epoch"]
+        self.plateau.load_state_dict(d["plateau"])
 
 
 def plot_loss_curves(history, save_path):
@@ -210,17 +253,37 @@ def validate(model, loader, normal_criterion, contrastive_criterion,
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data-path",          type=str, required=True)
-    p.add_argument("--val-split",          type=float, default=0.05)
+    p.add_argument("--layout",             type=str, default="flat", choices=["flat", "nested"],
+                   help="flat: path/sensor_XXXX/...（原本）；nested: path/<obj>/session_xxx/sensor_0000/...（gs_blender 產生的）")
+    p.add_argument("--gt-norm",            action="store_true", default=False,
+                   help="nested 模式：用 norms/xxxx_gt.png（真實幾何法線）當目標；預設用 norms/xxxx.png（gel 渲染法線）")
+    p.add_argument("--val-split",          type=float, default=0.05,
+                   help="隨機切時的 val 比例（沒給 --val-objects 時用）")
+    p.add_argument("--val-objects",        type=str, nargs="+", default=None,
+                   help="nested 模式：指定哪些物體當 validation（held-out by object）。給了就按物體切，否則隨機切。")
     p.add_argument("--num-sensors",        type=int, default=None)
     p.add_argument("--num-samples",        type=int, default=None)
     p.add_argument("--pretrain-weights",   type=str, default=None)
-    p.add_argument("--calibration-config", type=int, default=18, choices=[0, 4, 8, 9, 18])
-    p.add_argument("--epochs",             type=int,   default=20)
+    p.add_argument("--calibration-config", type=int, default=18, choices=[0, 4, 8, 9, 18, 19])
+    p.add_argument("--raw-input",         action="store_true", default=False,
+                   help="Use raw tactile images without background subtraction; auto-sets calib=19")
+    p.add_argument("--tactile-augment",   action="store_true", default=False,
+                   help="Tactile-specific augmentation (gain/bias/grad/noise/flip/rotate)")
+    p.add_argument("--epochs",             type=int,   default=500,
+                   help="Max epochs (early stopping may end sooner)")
     p.add_argument("--batch-size",         type=int,   default=64)
     p.add_argument("--lr",                 type=float, default=1e-5)
     p.add_argument("--min-lr",             type=float, default=1e-7)
-    p.add_argument("--warmup-epochs",      type=int,   default=2)
+    p.add_argument("--warmup-epochs",      type=int,   default=5)
     p.add_argument("--weight-decay",       type=float, default=0.05)
+    p.add_argument("--scheduler",          type=str, default="plateau",
+                   choices=["cosine", "plateau"])
+    p.add_argument("--plateau-patience",   type=int, default=10,
+                   help="ReduceLROnPlateau: epochs to wait before reducing LR")
+    p.add_argument("--plateau-factor",     type=float, default=0.5,
+                   help="ReduceLROnPlateau: LR *= factor on plateau")
+    p.add_argument("--early-stop",         type=int, default=30,
+                   help="Stop if val loss doesn't improve for N epochs (0=off)")
     p.add_argument("--lambda-normal",      type=float, default=1.0)
     p.add_argument("--lambda-scl",         type=float, default=1.0)
     p.add_argument("--temperature",        type=float, default=0.07)
@@ -230,8 +293,9 @@ def parse_args():
     p.add_argument("--gpu-ids",            type=int, nargs="+", default=None,
                    help="DDP 模式用，例如 --gpu-ids 0 3")
     p.add_argument("--num-workers",        type=int, default=4)
+    p.add_argument("--no-pin-memory",      action="store_true", default=False)
     p.add_argument("--save-path",          type=str, default="checkpoints/sitr_finetune")
-    p.add_argument("--save-every",         type=int, default=5)
+    p.add_argument("--save-every",         type=int, default=1)
     p.add_argument("--resume",             type=str, default=None)
     p.add_argument("--seed",               type=int, default=42)
     return p.parse_args()
@@ -265,6 +329,10 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    # ── raw-input auto-config ────────────────────────────────────────────────
+    if args.raw_input and args.calibration_config == 18:
+        args.calibration_config = 19
+
     if is_main:
         print(f"Device: {device}  DDP: {is_ddp}")
         os.makedirs(args.save_path, exist_ok=True)
@@ -273,31 +341,64 @@ def main():
     if is_main:
         print("Loading dataset …")
 
-    full_dataset = sim_dataset(
-        path=args.data_path,
-        augment=True,
-        calibration_config=args.calibration_config,
-        sendTwo=True,
-        num_samples=args.num_samples,
-        num_sensors=args.num_sensors,
-    )
+    if args.raw_input:
+        img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=raw_mu, std=raw_std)])
+        norm_xform = T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)])
+    else:
+        img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
+        norm_xform = T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)])
 
-    n_val   = max(1, int(len(full_dataset) * args.val_split))
-    n_train = len(full_dataset) - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed)
-    )
+    def build_dataset(augment, include_objects=None):
+        if args.layout == "nested":
+            return sim_dataset_nested(
+                path=args.data_path,
+                augment=augment,
+                transforms=img_xform,
+                norm_transforms=norm_xform,
+                calibration_config=args.calibration_config,
+                sendTwo=True,
+                num_samples=args.num_samples,
+                use_gt_norm=args.gt_norm,
+                include_objects=include_objects,
+                raw_input=args.raw_input,
+                tactile_augment=augment and args.tactile_augment,
+            )
+        return sim_dataset(
+            path=args.data_path,
+            augment=augment,
+            calibration_config=args.calibration_config,
+            sendTwo=True,
+            num_samples=args.num_samples,
+            num_sensors=args.num_sensors,
+        )
 
-    val_ds_noaug = sim_dataset(
-        path=args.data_path,
-        augment=False,
-        calibration_config=args.calibration_config,
-        sendTwo=True,
-        num_samples=args.num_samples,
-        num_sensors=args.num_sensors,
-    )
-    val_ds_noaug = torch.utils.data.Subset(val_ds_noaug, val_ds.indices)
+    if args.layout == "nested" and args.val_objects:
+        # ── 按物體切 train/val（held-out by object，量對新物體的泛化）──
+        import glob as _glob
+        all_objs = sorted({os.path.basename(os.path.dirname(os.path.dirname(p)))
+                           for p in _glob.glob(os.path.join(args.data_path, '*', 'session_*', 'sensor_*'))})
+        val_objs = list(args.val_objects)
+        missing = [o for o in val_objs if o not in all_objs]
+        if missing:
+            raise ValueError(f"--val-objects 不存在: {missing}\n可用物體: {all_objs}")
+        train_objs = [o for o in all_objs if o not in set(val_objs)]
+        if is_main:
+            print(f"按物體切：train {len(train_objs)} 物體 / val {len(val_objs)} 物體（互不重疊）")
+            print(f"  val objects  : {val_objs}")
+            print(f"  train objects: {train_objs}")
+        train_ds     = build_dataset(augment=True,  include_objects=train_objs)
+        val_ds_noaug = build_dataset(augment=False, include_objects=val_objs)
+    else:
+        # ── 隨機切（原本行為，in-distribution val）──
+        full_dataset = build_dataset(augment=True)
+        n_val   = max(1, int(len(full_dataset) * args.val_split))
+        n_train = len(full_dataset) - n_val
+        train_ds, val_ds = torch.utils.data.random_split(
+            full_dataset, [n_train, n_val],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+        val_ds_noaug = build_dataset(augment=False)
+        val_ds_noaug = torch.utils.data.Subset(val_ds_noaug, val_ds.indices)
 
     if is_ddp:
         train_sampler = DistributedSampler(train_ds, shuffle=True,
@@ -313,7 +414,7 @@ def main():
         train_ds, batch_size=args.batch_size,
         shuffle=shuffle, sampler=train_sampler,
         num_workers=args.num_workers,
-        pin_memory=True, drop_last=True,
+        pin_memory=(not args.no_pin_memory), drop_last=True,
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=(2 if args.num_workers > 0 else None),
     )
@@ -321,7 +422,7 @@ def main():
         val_ds_noaug, batch_size=args.batch_size,
         shuffle=False, sampler=val_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(not args.no_pin_memory),
         persistent_workers=(args.num_workers > 0),
         prefetch_factor=(2 if args.num_workers > 0 else None),
     )
@@ -345,10 +446,19 @@ def main():
     # DDP 時 lr 按 GPU 數量 scale
     effective_lr = args.lr * (dist.get_world_size() if is_ddp else 1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=effective_lr,
-                              weight_decay=0.1,  # 從 0.05 提高
+                              weight_decay=args.weight_decay,
                               betas=(0.9, 0.999))
-    scheduler = get_scheduler(optimizer, args.warmup_epochs, args.epochs,
-                               warmup_lr=1e-8, base_lr=effective_lr, min_lr=args.min_lr)
+    if args.scheduler == "cosine":
+        scheduler = get_scheduler(optimizer, args.warmup_epochs, args.epochs,
+                                   warmup_lr=1e-8, base_lr=effective_lr, min_lr=args.min_lr)
+    else:
+        scheduler = WarmupThenPlateau(
+            optimizer, args.warmup_epochs,
+            warmup_lr=1e-8, base_lr=effective_lr,
+            factor=args.plateau_factor,
+            plateau_patience=args.plateau_patience,
+            min_lr=args.min_lr,
+        )
     scaler = GradScaler("cuda", enabled=args.amp)
 
     # ── weights loading ───────────────────────────────────────────────────────
@@ -372,9 +482,15 @@ def main():
             print(f"Loading pretrained weights: {args.pretrain_weights}")
         state = torch.load(args.pretrain_weights, map_location=device)
         raw_model = model.module if is_ddp else model
-        raw_model.load_state_dict(state)
+        model_state = raw_model.state_dict()
+        compatible = {k: v for k, v in state.items()
+                      if k in model_state and v.shape == model_state[k].shape}
+        skipped = [k for k in state if k not in compatible]
+        raw_model.load_state_dict(compatible, strict=False)
         if is_main:
-            print(f"  Loaded. lr={effective_lr:.1e}")
+            if skipped:
+                print(f"  Skipped {len(skipped)} keys (shape mismatch): {skipped}")
+            print(f"  Loaded {len(compatible)}/{len(state)} keys. lr={effective_lr:.1e}")
 
     # ── history & log（只有 rank 0 寫）────────────────────────────────────────
     history = {"epochs": [], "train_loss": [], "l_normal": [],
@@ -386,12 +502,20 @@ def main():
             f.write("epoch,train_loss,l_normal,l_scl,val_loss,lr\n")
 
     # ── training loop ─────────────────────────────────────────────────────────
+    epochs_no_improve = 0
+
     if is_main:
         n_gpus = dist.get_world_size() if is_ddp else 1
         print("\n" + "=" * 60)
+        input_mode = "RAW (no bg-sub)" if args.raw_input else "DIFF (bg-sub)"
+        aug_mode = "tactile" if args.tactile_augment else "standard"
         print(f"SITR Fine-tuning  |  GPUs={n_gpus}  epochs={args.epochs}"
               f"  bs={args.batch_size}×{n_gpus}={args.batch_size*n_gpus}"
-              f"  lr={effective_lr:.1e}")
+              f"  lr={effective_lr:.1e}"
+              f"  scheduler={args.scheduler}"
+              f"  early_stop={args.early_stop}")
+        print(f"Input: {input_mode}  calib={args.calibration_config}"
+              f"  augment={aug_mode}")
         print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
@@ -412,7 +536,10 @@ def main():
             args.lambda_normal, args.lambda_scl,
             device, args.amp
         )
-        scheduler.step()
+        if args.scheduler == "plateau":
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
 
         # DDP：把各 GPU 的 val_loss 平均
         if is_ddp:
@@ -450,8 +577,11 @@ def main():
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                epochs_no_improve = 0
                 save_ckpt(os.path.join(args.save_path, "best.pth"))
                 print(f"  ✓ best val_loss={best_val_loss:.4f}  →  best.pth")
+            else:
+                epochs_no_improve += 1
 
             if (epoch + 1) % args.save_every == 0:
                 save_ckpt(os.path.join(args.save_path, f"epoch_{epoch:04d}.pth"))
@@ -460,6 +590,10 @@ def main():
 
             if len(history["epochs"]) >= 2:
                 plot_loss_curves(history, args.save_path)
+
+            if args.early_stop > 0 and epochs_no_improve >= args.early_stop:
+                print(f"\n  Early stopping: no improvement for {args.early_stop} epochs")
+                break
 
     if is_main:
         print(f"\nDone. Best val loss: {best_val_loss:.4f}")

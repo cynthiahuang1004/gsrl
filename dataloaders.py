@@ -8,6 +8,7 @@ import numpy as np
 import random
 from tqdm import tqdm
 import albumentations as A
+import cv2
 
 # Dataset statistics for normalization
 # These values are pre-computed for the dataset with background subtraction
@@ -21,6 +22,138 @@ dmap_std = [30.3624]
 # Statistics for surface normals
 norm_mu = [126.9855, 127.2061, 247.7740]
 norm_std = [25.1953, 25.5532, 22.1101]
+
+# Statistics for raw (non-background-subtracted) tactile images
+# Simple [-1, 1] normalization; recompute with __main__ for exact values
+raw_mu = [127.5, 127.5, 127.5]
+raw_std = [127.5, 127.5, 127.5]
+
+# ImageNet normalization stats scaled to [0, 255] float32 input
+# (standard [0.485,0.456,0.406] / [0.229,0.224,0.225] × 255)
+imagenet_mu = [123.675, 116.28, 103.53]
+imagenet_std = [58.395, 57.12, 57.375]
+
+DEFAULT_AUGMENT_PARAMS = {
+    'gain':    0.5,
+    'bias':    45.0,
+    'grad':    0.7,
+    'bright':  25.0,
+    'resid':   20.0,
+    'noise':   6.0,
+    'rot_deg': 15.0,
+    'hflip':   True,
+    'vflip':   True,
+}
+
+
+class TactileAugment:
+    """Tactile sensor augmentation for DPT training.
+
+    Photometric augmentations (gain, bias, bright, grad, noise, resid)
+    are applied to the diff image only.  Geometric augmentations (flip,
+    rotate) are applied to diff, calibration diffs, depth AND normal maps
+    with proper normal-direction correction.
+    """
+
+    def __init__(self, params=None):
+        self.p = {**DEFAULT_AUGMENT_PARAMS, **(params or {})}
+
+    def __call__(self, sample_diff, calib_diffs, depth, normal):
+        p = self.p
+        H, W = sample_diff.shape[:2]
+
+        # ── photometric (sample_diff only) ────────────────────────────
+        if p['gain'] > 0:
+            g = np.random.uniform(1 - p['gain'], 1 + p['gain'],
+                                  size=(1, 1, 3)).astype(np.float32)
+            sample_diff = sample_diff * g
+
+        if p['bias'] > 0:
+            b = np.random.uniform(-p['bias'], p['bias'],
+                                  size=(1, 1, 3)).astype(np.float32)
+            sample_diff = sample_diff + b
+
+        if p['bright'] > 0:
+            sample_diff = sample_diff + np.float32(
+                np.random.uniform(-p['bright'], p['bright']))
+
+        if p['grad'] > 0:
+            angle = np.random.uniform(0, 2 * np.pi)
+            ys = np.linspace(-1, 1, H, dtype=np.float32).reshape(-1, 1)
+            xs = np.linspace(-1, 1, W, dtype=np.float32).reshape(1, -1)
+            grad_map = (np.float32(np.cos(angle)) * xs
+                        + np.float32(np.sin(angle)) * ys)
+            amp = np.random.uniform(0, p['grad'],
+                                    size=(1, 1, 3)).astype(np.float32)
+            sample_diff = sample_diff + grad_map[..., None] * amp * np.float32(50.0)
+
+        if p['resid'] > 0:
+            raw = np.random.randn(16, 16, 3).astype(np.float32)
+            smooth = cv2.resize(raw, (W, H), interpolation=cv2.INTER_LINEAR)
+            smooth = cv2.GaussianBlur(smooth, (0, 0), sigmaX=H / 8.0)
+            std = np.float32(smooth.std())
+            if std > 1e-6:
+                smooth = smooth / std * np.float32(p['resid'])
+            sample_diff = sample_diff + smooth
+
+        if p['noise'] > 0:
+            noise = np.random.normal(0, p['noise'],
+                                     sample_diff.shape).astype(np.float32)
+            sample_diff = sample_diff + noise
+
+        # ── geometric (all images) ────────────────────────────────────
+        do_hflip = p['hflip'] and np.random.random() < 0.5
+        do_vflip = p['vflip'] and np.random.random() < 0.5
+        rot_angle = 0.0
+        if p['rot_deg'] > 0:
+            rot_angle = np.random.uniform(-p['rot_deg'], p['rot_deg'])
+
+        if do_hflip:
+            sample_diff = np.ascontiguousarray(sample_diff[:, ::-1])
+            calib_diffs = [np.ascontiguousarray(c[:, ::-1]) for c in calib_diffs]
+            if depth is not None:
+                depth = np.ascontiguousarray(depth[:, ::-1])
+            if normal is not None:
+                normal = np.ascontiguousarray(normal[:, ::-1])
+                normal[:, :, 0] = 255.0 - normal[:, :, 0]
+
+        if do_vflip:
+            sample_diff = np.ascontiguousarray(sample_diff[::-1])
+            calib_diffs = [np.ascontiguousarray(c[::-1]) for c in calib_diffs]
+            if depth is not None:
+                depth = np.ascontiguousarray(depth[::-1])
+            if normal is not None:
+                normal = np.ascontiguousarray(normal[::-1])
+                normal[:, :, 1] = 255.0 - normal[:, :, 1]
+
+        if abs(rot_angle) > 0.5:
+            M = cv2.getRotationMatrix2D((W / 2, H / 2), rot_angle, 1.0)
+            flags = cv2.INTER_LINEAR
+            border = cv2.BORDER_REFLECT_101
+
+            sample_diff = cv2.warpAffine(sample_diff, M, (W, H),
+                                          flags=flags, borderMode=border)
+            calib_diffs = [cv2.warpAffine(c, M, (W, H),
+                                           flags=flags, borderMode=border)
+                           for c in calib_diffs]
+            if depth is not None:
+                depth = cv2.warpAffine(depth, M, (W, H),
+                                       flags=flags, borderMode=border)
+            if normal is not None:
+                normal = cv2.warpAffine(normal, M, (W, H),
+                                         flags=flags, borderMode=border)
+                rad = np.radians(rot_angle)
+                cos_a = np.float32(np.cos(rad))
+                sin_a = np.float32(np.sin(rad))
+                nx = normal[:, :, 0] / 127.5 - 1.0
+                ny = normal[:, :, 1] / 127.5 - 1.0
+                new_nx = cos_a * nx + sin_a * ny
+                new_ny = -sin_a * nx + cos_a * ny
+                normal[:, :, 0] = np.clip((new_nx + 1.0) * 127.5, 0, 255)
+                normal[:, :, 1] = np.clip((new_ny + 1.0) * 127.5, 0, 255)
+
+        return sample_diff, calib_diffs, depth, normal
+
 
 class sim_dataset(Dataset):
     """
@@ -186,6 +319,172 @@ class sim_dataset(Dataset):
         
         return {'sample': sample, 'calibration': calib, 'dmap': dmap, 'norm' : norm, 'idx': idx}
     
+class sim_dataset_nested(Dataset):
+    """
+    sim_dataset 的巢狀版本，給 gs_blender 產生的資料集用：
+        path/<obj>/session_xxx/sensor_0000/{calibration,samples,dmaps,norms}/
+    與原本 sim_dataset 的差異：
+      1. 目錄是巢狀（<obj>/session_xxx/sensor_*），不是平鋪的 sensor_XXXX。
+      2. 每個 unit 只有 1 個 sensor，無法用「同 sample、不同 sensor」做對比正樣本對；
+         改用「同一張 sample 的兩次隨機增強」當正樣本對（SimCLR 式）。
+    其餘（背景相減、18 張 calibration、normalization、224x224）與原本一致，
+    回傳格式也一致：{sample, calibration, dmap, norm, idx}。
+    """
+    def __init__(self,
+                 path,
+                 augment=False,
+                 sendTwo=False,
+                 transforms=T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)]),
+                 dmap_transforms=T.Compose([T.ToTensor(), T.Normalize(mean=dmap_mu, std=dmap_std)]),
+                 norm_transforms=T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)]),
+                 calibration_config=18,
+                 num_samples=None,
+                 use_gt_norm=False,
+                 include_objects=None,        # 只收這些物體的 unit（按物體切 train/val 用）
+                 num_sensors=None,            # num_sensors 僅為 API 相容，巢狀版用不到
+                 raw_input=False,
+                 tactile_augment=False,
+                 augment_params=None) -> None:
+        self.path = path
+        self.transforms = transforms
+        self.dmap_transforms = dmap_transforms
+        self.norm_transforms = norm_transforms
+        self.sendTwo = sendTwo
+        self.norm_suffix = '_gt' if use_gt_norm else ''
+        self._calib_cache = {}   # 每個 unit 的 (ref, 18×calib) 原始影像，避免每 sample 重讀
+
+        if calibration_config == 0: self.calib_list = []
+        elif calibration_config == 4: self.calib_list = [1,3,7,9]
+        elif calibration_config == 8: self.calib_list = [1,3,7,9,10,12,16,18]
+        elif calibration_config == 9: self.calib_list = [i for i in range(1, 10)]
+        elif calibration_config == 18: self.calib_list = [i for i in range(1, 19)]
+        elif calibration_config == 19: self.calib_list = [i for i in range(0, 19)]
+        else: raise ValueError('Invalid calibration configuration')
+
+        self.raw_input = raw_input
+
+        # 找出所有 unit：<obj>/session_*/sensor_*（找不到就退回平鋪 sensor_*）
+        import glob as _glob
+        units = sorted(_glob.glob(osp.join(path, '*', 'session_*', 'sensor_*')))
+        if not units:
+            units = sorted(_glob.glob(osp.join(path, 'sensor_*')))
+        units = [u for u in units
+                 if osp.isdir(osp.join(u, 'samples')) and osp.isdir(osp.join(u, 'calibration'))]
+        # 按物體過濾：unit 路徑 = .../<obj>/session_xxx/sensor_xxxx → 取 <obj>
+        if include_objects is not None:
+            incl = set(include_objects)
+            units = [u for u in units
+                     if osp.basename(osp.dirname(osp.dirname(u))) in incl]
+        if not units:
+            raise RuntimeError(f'在 {path} 找不到任何 unit（include_objects={include_objects}）')
+        self.units = units
+        self.objects = sorted({osp.basename(osp.dirname(osp.dirname(u))) for u in units})
+
+        # 每個 unit 的 sample 數（取第一個 unit；排除 *_gt）
+        samp = [f for f in os.listdir(osp.join(units[0], 'samples'))
+                if f.endswith('.png') and '_gt' not in f]
+        avail = len(samp)
+        self.samples_per_unit = min(num_samples, avail) if num_samples else avail
+        self.num_sensors = len(units)        # 對外語意：unit 數
+        self.num_samples = self.samples_per_unit
+
+        # 增強 pipeline
+        self.tactile_aug = TactileAugment(augment_params) if tactile_augment else None
+        extra = {f'c{i}': 'image' for i in range(0, 19)}
+        if augment and not tactile_augment:
+            self.augment = A.Compose([A.ColorJitter(brightness=(0.6, 1.2), contrast=(0.8, 1.2),
+                                                    saturation=(0.8, 1.2), hue=(-0.2, 0.2)),
+                                      A.Blur()],
+                                     additional_targets=extra)
+        else:
+            self.augment = A.Compose([], additional_targets=extra)
+
+    def __len__(self) -> int:
+        return len(self.units) * self.samples_per_unit
+
+    def _get_calib(self, unit):
+        """讀取並快取一個 unit 的 calibration（ref + 18 張）。同 unit 的 calib 固定，
+        只讀一次，之後所有 sample 重用，大幅減少磁碟 I/O。"""
+        cached = self._calib_cache.get(unit)
+        if cached is None:
+            cal_dir = osp.join(unit, 'calibration')
+            ref = np.array(Image.open(osp.join(cal_dir, '0000.png')))
+            calib = [np.array(Image.open(osp.join(cal_dir, '{0:04}.png'.format(i))))
+                     for i in range(1, 19)]
+            cached = (ref, calib)
+            self._calib_cache[unit] = cached
+        return cached
+
+    def getitem_helper(self, unit, sample_idx):
+        ref_img, calib_raw = self._get_calib(unit)
+
+        sample = np.array(Image.open(osp.join(unit, 'samples', '{0:04}.png'.format(sample_idx))))
+
+        if self.raw_input:
+            # Raw mode: no background subtraction, ref included in calibration
+            sample_f = sample.astype(np.float32)
+            all_imgs = [ref_img.astype(np.float32)] + [c.astype(np.float32) for c in calib_raw]
+            calib_imgs = [all_imgs[i] for i in self.calib_list]
+        elif self.tactile_aug is not None:
+            ref_f = ref_img.astype(np.float32)
+            sample_f = sample.astype(np.float32) - ref_f
+            calib_imgs = [(calib_raw[i - 1].astype(np.float32) - ref_f)
+                           for i in self.calib_list]
+        else:
+            augments = self.augment(image=sample,
+                                    c0=ref_img,
+                                    c1=calib_raw[0], c2=calib_raw[1], c3=calib_raw[2],
+                                    c4=calib_raw[3], c5=calib_raw[4], c6=calib_raw[5],
+                                    c7=calib_raw[6], c8=calib_raw[7], c9=calib_raw[8],
+                                    c10=calib_raw[9], c11=calib_raw[10], c12=calib_raw[11],
+                                    c13=calib_raw[12], c14=calib_raw[13], c15=calib_raw[14],
+                                    c16=calib_raw[15], c17=calib_raw[16], c18=calib_raw[17])
+            ref_f = np.array(augments['c0'], dtype=np.float32)
+            sample_f = augments['image'].astype(np.float32) - ref_f
+            calib_imgs = [(augments[f'c{i}'].astype(np.float32) - ref_f)
+                           for i in self.calib_list]
+
+        depth = normal = None
+        try:
+            dmap_path = osp.join(unit, 'dmaps', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
+            depth = np.array(Image.open(dmap_path), dtype=np.float32)
+            norm_path = osp.join(unit, 'norms', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
+            normal = np.array(Image.open(norm_path), dtype=np.float32)
+        except Exception:
+            pass
+
+        if self.tactile_aug is not None:
+            sample_f, calib_imgs, depth, normal = self.tactile_aug(
+                sample_f, calib_imgs, depth, normal)
+
+        sample_t = self.transforms(sample_f)
+        calib_t = torch.cat([self.transforms(c) for c in calib_imgs]) if calib_imgs else torch.empty(0)
+        dmap_t = self.dmap_transforms(depth) if depth is not None else None
+        norm_t = self.norm_transforms(normal) if normal is not None else None
+
+        return sample_t, calib_t, dmap_t, norm_t
+
+    def __getitem__(self, index):
+        if index >= len(self): raise IndexError(f"Index {index} out of range")
+        unit_idx   = index // self.samples_per_unit
+        sample_idx = index % self.samples_per_unit
+        unit = self.units[unit_idx]
+
+        sample, calib, dmap, norm = self.getitem_helper(unit, sample_idx)
+
+        if self.sendTwo:
+            # 第二個 view = 同一張 sample 的另一次隨機增強（augment=False 時兩者相同）
+            sample2, calib2, dmap2, norm2 = self.getitem_helper(unit, sample_idx)
+            calib  = torch.stack([calib,  calib2],  dim=0)
+            sample = torch.stack([sample, sample2], dim=0)
+            dmap   = torch.stack([dmap,   dmap2],   dim=0)
+            norm   = torch.stack([norm,   norm2],   dim=0)
+
+        # label 取全域唯一 index → SupCon 退化為 SimCLR（只有自己的兩個 view 互為正樣本）
+        idx = torch.tensor(index)
+        return {'sample': sample, 'calibration': calib, 'dmap': dmap, 'norm': norm, 'idx': idx}
+
+
 class classification_dataset(Dataset):
     """
     Custom dataset class for classification tasks.
