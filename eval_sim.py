@@ -46,7 +46,7 @@ import matplotlib.pyplot as plt
 import torchvision.transforms as T
 from dataloaders import sim_dataset_nested, norm_mu, norm_std, dmap_mu, dmap_std, sample_mu, sample_std, raw_mu, raw_std, imagenet_mu, imagenet_std
 from models.networks import SITR_base
-from models.dpt import SITRWithDPT, DINOv2WithDPT, DINOv3WithDPT
+from models.dpt import SITRWithDPT, DINOv2WithDPT, DINOv3WithDPT, DAv2WithDPT
 
 
 # ── unnormalize helpers ──────────────────────────────────────────────────────
@@ -337,7 +337,7 @@ def eval_dpt(model, loader, device, save_path, num_vis, unnorm_fn=None):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", type=str, required=True, choices=["sitr", "dpt", "dinov2", "dinov3"])
+    p.add_argument("--mode", type=str, required=True, choices=["sitr", "dpt", "dinov2", "dinov3", "dav2"])
     p.add_argument("--data-path", type=str, required=True)
     p.add_argument("--weights", type=str, default=None,
                    help="SITR checkpoint (mode=sitr)")
@@ -350,6 +350,10 @@ def parse_args():
     p.add_argument("--dinov3-model", type=str, default="dinov3_vitl16")
     p.add_argument("--dinov3-weights", type=str, default=None,
                    help="Local .pth path for DINOv3 pretrained backbone weights")
+    p.add_argument("--dav2-weights", type=str, default=None,
+                   help="DAv2 full checkpoint .pth (encoder extracted automatically)")
+    p.add_argument("--dav2-dinov2-model", type=str, default="dinov2_vitl14",
+                   help="DINOv2 backbone used by DAv2 (vits14/vitb14/vitl14)")
     p.add_argument("--val-objects", type=str, nargs="+", default=None)
     p.add_argument("--gt-norm", action="store_true", default=False)
     p.add_argument("--calibration-config", type=int, default=18)
@@ -368,7 +372,7 @@ def main():
     os.makedirs(args.save_path, exist_ok=True)
 
     # ── auto-config for dinov2/dinov3 ────────────────────────────────────────
-    if args.mode in ("dinov2", "dinov3"):
+    if args.mode in ("dinov2", "dinov3", "dav2"):
         args.raw_input = True
         args.calibration_config = 0
 
@@ -376,7 +380,7 @@ def main():
         args.calibration_config = 19
 
     # ── dataset ───────────────────────────────────────────────────────────────
-    if args.mode in ("dinov2", "dinov3"):
+    if args.mode in ("dinov2", "dinov3", "dav2"):
         img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=imagenet_mu, std=imagenet_std)])
     elif args.raw_input:
         img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=raw_mu, std=raw_std)])
@@ -455,6 +459,30 @@ def main():
         dec_state = dpt_ckpt["decoder"] if "decoder" in dpt_ckpt else dpt_ckpt
         model.decoder.load_state_dict(dec_state)
         print(f"Loaded DINOv3 ({args.dinov3_model}) + DPT decoder from {args.decoder_weights}")
+
+        model.eval()
+
+        metrics = eval_dpt(model, loader, device, args.save_path, args.num_vis,
+                           unnorm_fn=unnorm_imagenet)
+
+    elif args.mode == "dav2":
+        layer_indices_map = {
+            "dinov2_vits14": (2, 5, 8, 11),
+            "dinov2_vitb14": (2, 5, 8, 11),
+            "dinov2_vitl14": (4, 11, 17, 23),
+        }
+        layer_indices = layer_indices_map.get(args.dav2_dinov2_model, (2, 5, 8, 11))
+        model = DAv2WithDPT(
+            model_name=args.dav2_dinov2_model,
+            weights=args.dav2_weights,
+            features=256,
+            layer_indices=layer_indices,
+        ).to(device)
+
+        dpt_ckpt = torch.load(args.decoder_weights, map_location="cpu", weights_only=False)
+        dec_state = dpt_ckpt["decoder"] if "decoder" in dpt_ckpt else dpt_ckpt
+        model.decoder.load_state_dict(dec_state)
+        print(f"Loaded DAv2 ({args.dav2_dinov2_model}) + DPT decoder from {args.decoder_weights}")
 
         model.eval()
 

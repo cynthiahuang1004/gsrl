@@ -168,6 +168,10 @@ sensor_0000/
 classification_dataset/
 renders/
 pose_dataset/
+training_logs/
+output_checkpoints/
+eval_results/
+.claude/
 *.pt
 *.pth
 *.ckpt

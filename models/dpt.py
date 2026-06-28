@@ -281,6 +281,62 @@ class DINOv2WithDPT(nn.Module):
         return {"depth": depth, "normal": normal}
 
 
+class DAv2MultiScale(nn.Module):
+    """Frozen Depth Anything V2 encoder (depth-finetuned DINOv2) for multi-scale features."""
+
+    def __init__(self, model_name='dinov2_vitb14', weights=None,
+                 layer_indices=(2, 5, 8, 11)):
+        super().__init__()
+        self.dinov2 = torch.hub.load('facebookresearch/dinov2', model_name)
+        self.layer_indices = sorted(layer_indices)
+        self.embed_dim = self.dinov2.embed_dim
+
+        if weights is not None:
+            print(f'  [encoder] loading DAv2 weights from {weights}')
+            ck = torch.load(weights, map_location='cpu', weights_only=False)
+            backbone_sd = {k.replace('pretrained.', ''): v
+                           for k, v in ck.items() if k.startswith('pretrained.')}
+            missing, unexpected = self.dinov2.load_state_dict(backbone_sd, strict=False)
+            print(f'  [encoder] loaded {len(backbone_sd) - len(unexpected)} / '
+                  f'{sum(1 for _ in self.dinov2.parameters())} parameters')
+            if missing:
+                print(f'  [encoder] WARNING: {len(missing)} missing keys')
+
+        for p in self.dinov2.parameters():
+            p.requires_grad = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.dinov2.eval()
+        return self
+
+    def forward(self, x):
+        features = self.dinov2.get_intermediate_layers(
+            x, n=self.layer_indices, reshape=False, return_class_token=False,
+        )
+        return list(features)
+
+
+class DAv2WithDPT(nn.Module):
+    """Frozen DAv2 encoder + trainable DPT decoder for depth + normal."""
+
+    def __init__(self, model_name='dinov2_vitb14', weights=None, features=256,
+                 layer_indices=(2, 5, 8, 11), dropout=0.0):
+        super().__init__()
+        self.encoder = DAv2MultiScale(model_name, weights, layer_indices)
+        embed_dim = self.encoder.embed_dim
+        self.decoder = DPTDecoder(embed_dim, features, dropout=dropout)
+
+    def forward(self, x, c=None):
+        features = self.encoder(x)
+        depth, normal = self.decoder(features)
+        h, w = x.shape[2:]
+        if depth.shape[2:] != (h, w):
+            depth = F.interpolate(depth, size=(h, w), mode='bilinear', align_corners=True)
+            normal = F.interpolate(normal, size=(h, w), mode='bilinear', align_corners=True)
+        return {"depth": depth, "normal": normal}
+
+
 def _count_blocks(backbone):
     blocks = getattr(backbone, 'blocks', None)
     if blocks is None:

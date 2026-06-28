@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt
 
 from dataloaders import sample_mu, sample_std, norm_mu, norm_std, dmap_mu, dmap_std, imagenet_mu, imagenet_std, raw_mu, raw_std
 from models.networks import SITR_base
-from models.dpt import SITRWithDPT, DINOv2WithDPT, DINOv3WithDPT
+from models.dpt import SITRWithDPT, DINOv2WithDPT, DINOv3WithDPT, DAv2WithDPT
 
 IMG = 224
 CALIB_LIST = list(range(1, 19))  # calibration_config = 18
@@ -105,6 +105,11 @@ def main():
     p.add_argument("--dinov3-model", default="dinov3_vitl16")
     p.add_argument("--dinov3-weights", default=None,
                    help="Local .pth path for DINOv3 pretrained backbone weights")
+    p.add_argument("--dav2-decoder", default=None,
+                   help="DAv2+DPT decoder checkpoint")
+    p.add_argument("--dav2-weights", default=None,
+                   help="DAv2 full checkpoint .pth")
+    p.add_argument("--dav2-dinov2-model", default="dinov2_vitl14")
     p.add_argument("--raw-input", action="store_true", default=False)
     p.add_argument("--calibration-config", type=int, default=18)
     p.add_argument("--out", default="eval_results/real")
@@ -206,11 +211,39 @@ def main():
         del model, raw_samples
         print("DINOv3 done")
 
+    # ── DAv2 ────────────────────────────────────────────────────────────
+    dav2_depth = dav2_normal = None
+    if args.dav2_decoder:
+        tf_inet = T.Compose([T.ToTensor(), T.Normalize(mean=imagenet_mu, std=imagenet_std)])
+        raw_samples = torch.stack([tf_inet(load_resized(f)) for f in files]).to(device)
+        layer_indices_map = {
+            "dinov2_vits14": (2, 5, 8, 11),
+            "dinov2_vitb14": (2, 5, 8, 11),
+            "dinov2_vitl14": (4, 11, 17, 23),
+        }
+        layer_indices = layer_indices_map.get(args.dav2_dinov2_model, (2, 5, 8, 11))
+        model = DAv2WithDPT(
+            model_name=args.dav2_dinov2_model,
+            weights=args.dav2_weights,
+            features=256,
+            layer_indices=layer_indices,
+        ).to(device)
+        dck = torch.load(args.dav2_decoder, map_location="cpu", weights_only=False)
+        model.decoder.load_state_dict(dck["decoder"] if "decoder" in dck else dck)
+        model.eval()
+        with torch.no_grad():
+            out = model(raw_samples)
+        dav2_depth = out["depth"].cpu()
+        dav2_normal = out["normal"].cpu()
+        del model, raw_samples
+        print("DAv2 done")
+
     # ── visualize ───────────────────────────────────────────────────────
     ncol = 2 + (1 if sitr_normal is not None else 0) \
              + (2 if dpt_depth is not None else 0) \
              + (2 if dino_depth is not None else 0) \
-             + (2 if dinov3_depth is not None else 0)
+             + (2 if dinov3_depth is not None else 0) \
+             + (2 if dav2_depth is not None else 0)
     for i, f in enumerate(files):
         fig, axes = plt.subplots(1, ncol, figsize=(3.4 * ncol, 3.6))
         c = 0
@@ -233,6 +266,11 @@ def main():
             axes[c].imshow(unnorm_normal(dinov3_normal[i])); axes[c].set_title("DINOv3 normal", fontsize=9); c += 1
             im = axes[c].imshow(unnorm_depth(dinov3_depth[i]), cmap="viridis")
             axes[c].set_title("DINOv3 depth", fontsize=9)
+            fig.colorbar(im, ax=axes[c], fraction=0.046, pad=0.04); c += 1
+        if dav2_depth is not None:
+            axes[c].imshow(unnorm_normal(dav2_normal[i])); axes[c].set_title("DAv2 normal", fontsize=9); c += 1
+            im = axes[c].imshow(unnorm_depth(dav2_depth[i]), cmap="viridis")
+            axes[c].set_title("DAv2 depth", fontsize=9)
             fig.colorbar(im, ax=axes[c], fraction=0.046, pad=0.04); c += 1
         for ax in axes:
             ax.axis("off")
