@@ -198,7 +198,7 @@ def plot_loss_curves(history, save_path):
 def train_one_epoch(model, loader, optimizer, scaler,
                     depth_criterion, normal_criterion,
                     lambda_depth, lambda_normal, lambda_grad,
-                    device, amp_enabled, epoch):
+                    device, amp_enabled, epoch, log_vars=None):
     model.train()
     loss_m  = AverageMeter()
     depth_m = AverageMeter()
@@ -219,7 +219,11 @@ def train_one_epoch(model, loader, optimizer, scaler,
             l_depth  = depth_criterion(out["depth"], gt_depth)
             l_normal = normal_criterion(out["normal"], gt_norm)
 
-            loss = lambda_depth * l_depth + lambda_normal * l_normal
+            if log_vars is not None:
+                loss = (torch.exp(-log_vars[0]) * l_depth + log_vars[0] +
+                        torch.exp(-log_vars[1]) * l_normal + log_vars[1])
+            else:
+                loss = lambda_depth * l_depth + lambda_normal * l_normal
 
             if lambda_grad > 0:
                 l_grad = gradient_loss(out["depth"], gt_depth)
@@ -237,10 +241,16 @@ def train_one_epoch(model, loader, optimizer, scaler,
 
         if step % 50 == 0:
             elapsed = time.time() - t0
+            kd_info = ""
+            if log_vars is not None:
+                w_d = torch.exp(-log_vars[0]).item()
+                w_n = torch.exp(-log_vars[1]).item()
+                kd_info = f"  w_d={w_d:.2f}  w_n={w_n:.2f}"
             print(f"  [epoch {epoch:03d} | step {step:04d}/{len(loader):04d}]"
                   f"  loss={loss_m.avg:.4f}"
                   f"  depth={depth_m.avg:.4f}"
                   f"  normal={norm_m.avg:.4f}"
+                  f"{kd_info}"
                   f"  ({elapsed:.1f}s)")
 
     return loss_m.avg, depth_m.avg, norm_m.avg
@@ -248,7 +258,7 @@ def train_one_epoch(model, loader, optimizer, scaler,
 
 @torch.no_grad()
 def validate(model, loader, depth_criterion, normal_criterion,
-             lambda_depth, lambda_normal, device, amp_enabled):
+             lambda_depth, lambda_normal, device, amp_enabled, log_vars=None):
     model.eval()
     loss_m  = AverageMeter()
     depth_m = AverageMeter()
@@ -264,7 +274,11 @@ def validate(model, loader, depth_criterion, normal_criterion,
             out = model(imgs, calibs)
             l_depth  = depth_criterion(out["depth"], gt_depth)
             l_normal = normal_criterion(out["normal"], gt_norm)
-            loss = lambda_depth * l_depth + lambda_normal * l_normal
+            if log_vars is not None:
+                loss = (torch.exp(-log_vars[0]) * l_depth + log_vars[0] +
+                        torch.exp(-log_vars[1]) * l_normal + log_vars[1])
+            else:
+                loss = lambda_depth * l_depth + lambda_normal * l_normal
 
         loss_m.update(loss.item(), imgs.size(0))
         depth_m.update(l_depth.item(), imgs.size(0))
@@ -289,6 +303,8 @@ def parse_args():
                    help="nested 模式：用 dmaps/xxxx_gt.png 與 norms/xxxx_gt.png（真實幾何）當 Stage 2 監督目標")
     p.add_argument("--val-objects", type=str, nargs="+", default=None,
                    help="nested 模式：指定哪些物體當 validation（held-out by object）；建議與 SITR finetune 用同一組")
+    p.add_argument("--val-every",   type=int, default=None,
+                   help="Per-session split: every N-th sample is val (e.g. 20 = 5%%)")
     p.add_argument("--val-split",   type=float, default=0.05)
     p.add_argument("--num-sensors", type=int, default=None)
     p.add_argument("--num-samples", type=int, default=None)
@@ -330,6 +346,8 @@ def parse_args():
     p.add_argument("--lambda-normal", type=float, default=1.0)
     p.add_argument("--lambda-grad",   type=float, default=0.0,
                    help="Weight for spatial gradient loss on depth (0 = off)")
+    p.add_argument("--kendall",       action="store_true", default=False,
+                   help="Use Kendall uncertainty weighting (learned task weights, ignores lambda-depth/normal)")
 
     # training
     p.add_argument("--epochs",        type=int,   default=500,
@@ -421,7 +439,21 @@ def main():
             num_sensors=args.num_sensors,
         )
 
-    if args.layout == "nested" and args.val_objects:
+    if args.val_every is not None:
+        # ── per-session split: every N-th sample is val ──
+        full_aug   = build_dataset(augment=True)
+        full_noaug = build_dataset(augment=False)
+        spu = full_aug.samples_per_unit
+        all_idx = list(range(len(full_aug)))
+        train_idx = [i for i in all_idx if (i % spu) % args.val_every != 0]
+        val_idx   = [i for i in all_idx if (i % spu) % args.val_every == 0]
+        train_ds     = torch.utils.data.Subset(full_aug,   train_idx)
+        val_ds_noaug = torch.utils.data.Subset(full_noaug, val_idx)
+        print(f"Per-session split: val_every={args.val_every} "
+              f"({len(val_idx)}/{len(all_idx)} val, "
+              f"{len(train_idx)}/{len(all_idx)} train)")
+
+    elif args.layout == "nested" and args.val_objects:
         # ── 按物體切（held-out by object；建議與 SITR finetune 同一組）──
         import glob as _glob
         all_objs = sorted({os.path.basename(os.path.dirname(os.path.dirname(p)))
@@ -529,12 +561,22 @@ def main():
     depth_criterion  = nn.MSELoss()
     normal_criterion = nn.MSELoss()
 
+    log_vars = None
+    if args.kendall:
+        log_vars = nn.Parameter(torch.zeros(2, device=device))
+        print("  Kendall uncertainty weighting: ON (learned task weights)")
+
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    if log_vars is not None:
+        trainable_params.append(log_vars)
+
     if args.unfreeze_encoder_layers > 0:
         encoder_params_list = [p for p in model.encoder.parameters() if p.requires_grad]
         decoder_params_list = [p for p in model.decoder.parameters() if p.requires_grad]
         param_groups = [
             {"params": encoder_params_list, "lr": args.encoder_lr},
-            {"params": decoder_params_list, "lr": args.lr},
+            {"params": decoder_params_list + ([log_vars] if log_vars is not None else []),
+             "lr": args.lr},
         ]
         optimizer = torch.optim.AdamW(
             param_groups, weight_decay=args.weight_decay, betas=(0.9, 0.999),
@@ -542,7 +584,7 @@ def main():
         print(f"  Optimizer: encoder_lr={args.encoder_lr:.1e}, decoder_lr={args.lr:.1e}")
     else:
         optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
+            trainable_params,
             lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999),
         )
     if args.scheduler == "cosine":
@@ -598,8 +640,11 @@ def main():
               f"  encoder_lr={args.encoder_lr:.1e}")
     else:
         print("Encoder: fully frozen")
-    print(f"Loss weights: depth={args.lambda_depth}"
-          f"  normal={args.lambda_normal}  grad={args.lambda_grad}")
+    if args.kendall:
+        print(f"Loss: Kendall uncertainty weighting (learned)  grad={args.lambda_grad}")
+    else:
+        print(f"Loss weights: depth={args.lambda_depth}"
+              f"  normal={args.lambda_normal}  grad={args.lambda_grad}")
     print(f"Augmentation: {'tactile (gain/bias/grad/noise/flip/rotate)' if has_tactile_aug else 'standard'}")
     print(f"Regularisation: weight_decay={args.weight_decay}  dropout={args.dropout}")
     print(f"Scheduler: {args.scheduler}  early_stop={args.early_stop}")
@@ -615,22 +660,27 @@ def main():
             model, train_loader, optimizer, scaler,
             depth_criterion, normal_criterion,
             args.lambda_depth, args.lambda_normal, args.lambda_grad,
-            device, args.amp, epoch,
+            device, args.amp, epoch, log_vars=log_vars,
         )
 
         val_loss, val_depth, val_normal = validate(
             model, val_loader,
             depth_criterion, normal_criterion,
             args.lambda_depth, args.lambda_normal,
-            device, args.amp,
+            device, args.amp, log_vars=log_vars,
         )
         if args.scheduler == "plateau":
             scheduler.step(val_loss)
         else:
             scheduler.step()
 
+        kd_str = ""
+        if log_vars is not None:
+            w_d = torch.exp(-log_vars[0]).item()
+            w_n = torch.exp(-log_vars[1]).item()
+            kd_str = f"  (kendall w_depth={w_d:.3f} w_normal={w_n:.3f})"
         print(f"  → train={train_loss:.4f}  depth={l_depth:.4f}"
-              f"  normal={l_normal:.4f}")
+              f"  normal={l_normal:.4f}{kd_str}")
         print(f"  → val={val_loss:.4f}    v_depth={val_depth:.4f}"
               f"  v_normal={val_normal:.4f}")
 
@@ -657,6 +707,8 @@ def main():
                 "best_val_loss": best_val_loss,
                 "args":          vars(args),
             }
+            if log_vars is not None:
+                ckpt_dict["log_vars"] = log_vars.data
             if args.unfreeze_encoder_layers > 0 and args.encoder == "sitr":
                 ckpt_dict["encoder"] = model.encoder.sitr.state_dict()
             torch.save(ckpt_dict, path)

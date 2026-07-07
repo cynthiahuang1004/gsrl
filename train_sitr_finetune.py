@@ -167,7 +167,7 @@ def plot_loss_curves(history, save_path):
 
 def train_one_epoch(model, loader, optimizer, scaler, normal_criterion,
                     contrastive_criterion, lambda_normal, lambda_scl,
-                    device, amp_enabled, epoch, is_ddp):
+                    device, amp_enabled, epoch, is_ddp, use_contrastive=True):
     model.train()
     if is_ddp:
         loader.sampler.set_epoch(epoch)
@@ -178,25 +178,37 @@ def train_one_epoch(model, loader, optimizer, scaler, normal_criterion,
     t0 = time.time()
 
     for step, batch in enumerate(loader):
-        imgs   = batch["sample"].to(device, non_blocking=True)
-        calibs = batch["calibration"].to(device, non_blocking=True)
-        norms  = batch["norm"].to(device, non_blocking=True)
-        labels = batch["idx"].to(device, non_blocking=True)
+        if use_contrastive:
+            imgs   = batch["sample"].to(device, non_blocking=True)
+            calibs = batch["calibration"].to(device, non_blocking=True)
+            norms  = batch["norm"].to(device, non_blocking=True)
+            labels = batch["idx"].to(device, non_blocking=True)
+            img_a,   img_b   = imgs[:, 0],   imgs[:, 1]
+            calib_a, calib_b = calibs[:, 0], calibs[:, 1]
+            norm_a,  norm_b  = norms[:, 0],  norms[:, 1]
+            B = img_a.size(0)
 
-        img_a,   img_b   = imgs[:, 0],   imgs[:, 1]
-        calib_a, calib_b = calibs[:, 0], calibs[:, 1]
-        norm_a,  norm_b  = norms[:, 0],  norms[:, 1]
-        B = img_a.size(0)
+            optimizer.zero_grad()
+            with autocast("cuda", enabled=amp_enabled):
+                out_a = model(img_a, calib_a)
+                out_b = model(img_b, calib_b)
+                l_normal = (normal_criterion(out_a["proj"], norm_a) +
+                            normal_criterion(out_b["proj"], norm_b)) * 0.5
+                feats = torch.stack([out_a["cls_token"], out_b["cls_token"]], dim=1)
+                l_scl = contrastive_criterion(feats, labels)
+                loss = lambda_normal * l_normal + lambda_scl * l_scl
+        else:
+            imgs   = batch["sample"].to(device, non_blocking=True)
+            calibs = batch["calibration"].to(device, non_blocking=True)
+            norms  = batch["norm"].to(device, non_blocking=True)
+            B = imgs.size(0)
 
-        optimizer.zero_grad()
-        with autocast("cuda", enabled=amp_enabled):
-            out_a = model(img_a, calib_a)
-            out_b = model(img_b, calib_b)
-            l_normal = (normal_criterion(out_a["proj"], norm_a) +
-                        normal_criterion(out_b["proj"], norm_b)) * 0.5
-            feats = torch.stack([out_a["cls_token"], out_b["cls_token"]], dim=1)
-            l_scl = contrastive_criterion(feats, labels)
-            loss = lambda_normal * l_normal + lambda_scl * l_scl
+            optimizer.zero_grad()
+            with autocast("cuda", enabled=amp_enabled):
+                out = model(imgs, calibs)
+                l_normal = normal_criterion(out["proj"], norms)
+                l_scl = torch.tensor(0.0, device=device)
+                loss = lambda_normal * l_normal
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -221,28 +233,37 @@ def train_one_epoch(model, loader, optimizer, scaler, normal_criterion,
 
 @torch.no_grad()
 def validate(model, loader, normal_criterion, contrastive_criterion,
-             lambda_normal, lambda_scl, device, amp_enabled):
+             lambda_normal, lambda_scl, device, amp_enabled, use_contrastive=True):
     model.eval()
     loss_meter = AverageMeter()
     norm_meter = AverageMeter()
     for batch in loader:
-        img_a   = batch["sample"][:, 0].to(device)
-        img_b   = batch["sample"][:, 1].to(device)
-        calib_a = batch["calibration"][:, 0].to(device)
-        calib_b = batch["calibration"][:, 1].to(device)
-        norm_a  = batch["norm"][:, 0].to(device)
-        norm_b  = batch["norm"][:, 1].to(device)
-        labels  = batch["idx"].to(device)
-        with autocast("cuda", enabled=amp_enabled):
-            out_a = model(img_a, calib_a)
-            out_b = model(img_b, calib_b)
-            l_normal = (normal_criterion(out_a["proj"], norm_a) +
-                        normal_criterion(out_b["proj"], norm_b)) * 0.5
-            feats = torch.stack([out_a["cls_token"], out_b["cls_token"]], dim=1)
-            l_scl = contrastive_criterion(feats, labels)
-            loss = lambda_normal * l_normal + lambda_scl * l_scl
-        loss_meter.update(loss.item(), img_a.size(0))
-        norm_meter.update(l_normal.item(), img_a.size(0))
+        if use_contrastive:
+            img_a   = batch["sample"][:, 0].to(device)
+            img_b   = batch["sample"][:, 1].to(device)
+            calib_a = batch["calibration"][:, 0].to(device)
+            calib_b = batch["calibration"][:, 1].to(device)
+            norm_a  = batch["norm"][:, 0].to(device)
+            norm_b  = batch["norm"][:, 1].to(device)
+            labels  = batch["idx"].to(device)
+            with autocast("cuda", enabled=amp_enabled):
+                out_a = model(img_a, calib_a)
+                out_b = model(img_b, calib_b)
+                l_normal = (normal_criterion(out_a["proj"], norm_a) +
+                            normal_criterion(out_b["proj"], norm_b)) * 0.5
+                feats = torch.stack([out_a["cls_token"], out_b["cls_token"]], dim=1)
+                l_scl = contrastive_criterion(feats, labels)
+                loss = lambda_normal * l_normal + lambda_scl * l_scl
+        else:
+            imgs   = batch["sample"].to(device)
+            calibs = batch["calibration"].to(device)
+            norms  = batch["norm"].to(device)
+            with autocast("cuda", enabled=amp_enabled):
+                out = model(imgs, calibs)
+                l_normal = normal_criterion(out["proj"], norms)
+                loss = lambda_normal * l_normal
+        loss_meter.update(loss.item(), imgs.size(0) if not use_contrastive else img_a.size(0))
+        norm_meter.update(l_normal.item(), imgs.size(0) if not use_contrastive else img_a.size(0))
     return loss_meter.avg, norm_meter.avg
 
 
@@ -258,9 +279,11 @@ def parse_args():
     p.add_argument("--gt-norm",            action="store_true", default=False,
                    help="nested 模式：用 norms/xxxx_gt.png（真實幾何法線）當目標；預設用 norms/xxxx.png（gel 渲染法線）")
     p.add_argument("--val-split",          type=float, default=0.05,
-                   help="隨機切時的 val 比例（沒給 --val-objects 時用）")
+                   help="隨機切時的 val 比例（沒給 --val-objects / --val-every 時用）")
     p.add_argument("--val-objects",        type=str, nargs="+", default=None,
                    help="nested 模式：指定哪些物體當 validation（held-out by object）。給了就按物體切，否則隨機切。")
+    p.add_argument("--val-every",          type=int, default=None,
+                   help="Per-session split: every N-th sample is val (e.g. 20 = 5%%). All objects appear in both train and val.")
     p.add_argument("--num-sensors",        type=int, default=None)
     p.add_argument("--num-samples",        type=int, default=None)
     p.add_argument("--pretrain-weights",   type=str, default=None)
@@ -348,6 +371,8 @@ def main():
         img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
         norm_xform = T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)])
 
+    use_contrastive = args.lambda_scl > 0
+
     def build_dataset(augment, include_objects=None):
         if args.layout == "nested":
             return sim_dataset_nested(
@@ -356,7 +381,7 @@ def main():
                 transforms=img_xform,
                 norm_transforms=norm_xform,
                 calibration_config=args.calibration_config,
-                sendTwo=True,
+                sendTwo=use_contrastive,
                 num_samples=args.num_samples,
                 use_gt_norm=args.gt_norm,
                 include_objects=include_objects,
@@ -367,12 +392,27 @@ def main():
             path=args.data_path,
             augment=augment,
             calibration_config=args.calibration_config,
-            sendTwo=True,
+            sendTwo=use_contrastive,
             num_samples=args.num_samples,
             num_sensors=args.num_sensors,
         )
 
-    if args.layout == "nested" and args.val_objects:
+    if args.val_every is not None:
+        # ── per-session split: every N-th sample is val ──
+        full_aug    = build_dataset(augment=True)
+        full_noaug  = build_dataset(augment=False)
+        spu = full_aug.samples_per_unit
+        all_idx = list(range(len(full_aug)))
+        train_idx = [i for i in all_idx if (i % spu) % args.val_every != 0]
+        val_idx   = [i for i in all_idx if (i % spu) % args.val_every == 0]
+        train_ds     = torch.utils.data.Subset(full_aug,   train_idx)
+        val_ds_noaug = torch.utils.data.Subset(full_noaug, val_idx)
+        if is_main:
+            print(f"Per-session split: val_every={args.val_every} "
+                  f"({len(val_idx)}/{len(all_idx)} val, "
+                  f"{len(train_idx)}/{len(all_idx)} train)")
+
+    elif args.layout == "nested" and args.val_objects:
         # ── 按物體切 train/val（held-out by object，量對新物體的泛化）──
         import glob as _glob
         all_objs = sorted({os.path.basename(os.path.dirname(os.path.dirname(p)))
@@ -438,7 +478,8 @@ def main():
         print(f"  params: {sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.1f}M")
 
     if is_ddp:
-        model = DDP(model, device_ids=[device_id])
+        model = DDP(model, device_ids=[device_id],
+                    find_unused_parameters=(not use_contrastive))
 
     normal_criterion      = nn.MSELoss()
     contrastive_criterion = SupConLoss(temperature=args.temperature)
@@ -514,8 +555,9 @@ def main():
               f"  lr={effective_lr:.1e}"
               f"  scheduler={args.scheduler}"
               f"  early_stop={args.early_stop}")
+        scl_mode = f"ON (λ={args.lambda_scl})" if use_contrastive else "OFF"
         print(f"Input: {input_mode}  calib={args.calibration_config}"
-              f"  augment={aug_mode}")
+              f"  augment={aug_mode}  contrastive={scl_mode}")
         print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
@@ -528,14 +570,15 @@ def main():
             model, train_loader, optimizer, scaler,
             normal_criterion, contrastive_criterion,
             args.lambda_normal, args.lambda_scl,
-            device, args.amp, epoch, is_ddp)
+            device, args.amp, epoch, is_ddp,
+            use_contrastive=use_contrastive)
 
         val_loss, val_norm = validate(
             model, val_loader,
             normal_criterion, contrastive_criterion,
             args.lambda_normal, args.lambda_scl,
-            device, args.amp
-        )
+            device, args.amp,
+            use_contrastive=use_contrastive)
         if args.scheduler == "plateau":
             scheduler.step(val_loss)
         else:
