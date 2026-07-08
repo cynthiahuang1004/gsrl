@@ -339,7 +339,13 @@ def parse_args():
 
     # augmentation
     p.add_argument("--tactile-augment", action="store_true", default=False,
-                   help="Tactile-specific augmentation (gain/bias/grad/noise/flip/rotate)")
+                   help="Tactile-specific augmentation (photometric: gain/bias/grad/noise)")
+    p.add_argument("--gel-spin-deg",    type=float, default=0.0,
+                   help="Gel-spin rotation aug max degrees (e.g. 180). 0=off")
+    p.add_argument("--center-crop",     action="store_true", default=False,
+                   help="Apply fixed 1/sqrt(2) center crop to all samples (train+val)")
+    p.add_argument("--depth-from-npy",  action="store_true", default=False,
+                   help="Load depth from raw_data/*.npy, compute normal from depth (VisTacFusion convention)")
 
     # loss weights
     p.add_argument("--lambda-depth",  type=float, default=1.0)
@@ -429,6 +435,9 @@ def main():
                 use_gt_norm=args.gt_norm,
                 include_objects=include_objects,
                 raw_input=args.raw_input,
+                gel_spin_max_deg=args.gel_spin_deg,
+                center_crop=args.center_crop,
+                depth_from_npy=args.depth_from_npy,
             )
         return sim_dataset(
             path=args.data_path,

@@ -33,6 +33,62 @@ raw_std = [127.5, 127.5, 127.5]
 imagenet_mu = [123.675, 116.28, 103.53]
 imagenet_std = [58.395, 57.12, 57.375]
 
+import math
+
+FIXED_CROP = 1.0 / math.sqrt(2.0)
+
+
+def fixed_center_crop(img, out_size=None):
+    """Center-crop to 1/sqrt(2) of the side, resize back to original (or out_size).
+    Applied to EVERY sample (train+val) so rotations up to 45° have no border artifacts."""
+    H, W = img.shape[:2]
+    side = int(math.floor(min(H, W) * FIXED_CROP))
+    off_y, off_x = (H - side) // 2, (W - side) // 2
+    crop = img[off_y:off_y + side, off_x:off_x + side]
+    out = out_size or (W, H)
+    if isinstance(out, int):
+        out = (out, out)
+    return cv2.resize(crop, out, interpolation=cv2.INTER_LINEAR)
+
+
+def depth_to_normal(depth, pixel_size_x, pixel_size_y):
+    """Compute unit surface normals from a depth map via central finite differences."""
+    dz_dx = np.zeros_like(depth)
+    dz_dy = np.zeros_like(depth)
+    dz_dx[:, 1:-1] = (depth[:, 2:] - depth[:, :-2]) / (2.0 * pixel_size_x)
+    dz_dy[1:-1, :] = (depth[2:, :] - depth[:-2, :]) / (2.0 * pixel_size_y)
+    dz_dx[:, 0] = (depth[:, 1] - depth[:, 0]) / pixel_size_x
+    dz_dx[:, -1] = (depth[:, -1] - depth[:, -2]) / pixel_size_x
+    dz_dy[0, :] = (depth[1, :] - depth[0, :]) / pixel_size_y
+    dz_dy[-1, :] = (depth[-1, :] - depth[-2, :]) / pixel_size_y
+    normal = np.stack([-dz_dx, -dz_dy, np.ones_like(depth)], axis=-1)
+    norm = np.linalg.norm(normal, axis=-1, keepdims=True).clip(min=1e-8)
+    return (normal / norm).astype(np.float32)
+
+
+def gel_spin_rotate(sample, calib_imgs, depth, normal, angle_deg):
+    """Rotate all images by angle_deg around center. Normal vectors are corrected."""
+    H, W = sample.shape[:2]
+    M = cv2.getRotationMatrix2D((W / 2, H / 2), angle_deg, 1.0)
+    flags, border = cv2.INTER_LINEAR, cv2.BORDER_REFLECT_101
+
+    sample = cv2.warpAffine(sample, M, (W, H), flags=flags, borderMode=border)
+    calib_imgs = [cv2.warpAffine(c, M, (W, H), flags=flags, borderMode=border)
+                  for c in calib_imgs]
+    if depth is not None:
+        depth = cv2.warpAffine(depth, M, (W, H), flags=flags, borderMode=border)
+    if normal is not None:
+        normal = cv2.warpAffine(normal, M, (W, H), flags=flags, borderMode=border)
+        rad = np.radians(angle_deg)
+        cos_a, sin_a = np.float32(np.cos(rad)), np.float32(np.sin(rad))
+        nx = normal[:, :, 0] / 127.5 - 1.0
+        ny = normal[:, :, 1] / 127.5 - 1.0
+        normal[:, :, 0] = np.clip((cos_a * nx + sin_a * ny + 1.0) * 127.5, 0, 255)
+        normal[:, :, 1] = np.clip((-sin_a * nx + cos_a * ny + 1.0) * 127.5, 0, 255)
+
+    return sample, calib_imgs, depth, normal
+
+
 DEFAULT_AUGMENT_PARAMS = {
     'gain':    0.5,
     'bias':    45.0,
@@ -40,9 +96,9 @@ DEFAULT_AUGMENT_PARAMS = {
     'bright':  25.0,
     'resid':   20.0,
     'noise':   6.0,
-    'rot_deg': 15.0,
-    'hflip':   True,
-    'vflip':   True,
+    'rot_deg': 0.0,
+    'hflip':   False,
+    'vflip':   False,
 }
 
 
@@ -344,7 +400,11 @@ class sim_dataset_nested(Dataset):
                  num_sensors=None,            # num_sensors 僅為 API 相容，巢狀版用不到
                  raw_input=False,
                  tactile_augment=False,
-                 augment_params=None) -> None:
+                 augment_params=None,
+                 gel_spin_max_deg=0.0,
+                 center_crop=False,
+                 depth_from_npy=False,
+                 gel_view_m=0.017502) -> None:
         self.path = path
         self.transforms = transforms
         self.dmap_transforms = dmap_transforms
@@ -362,6 +422,10 @@ class sim_dataset_nested(Dataset):
         else: raise ValueError('Invalid calibration configuration')
 
         self.raw_input = raw_input
+        self.gel_spin_max_deg = gel_spin_max_deg if augment else 0.0
+        self.center_crop = center_crop
+        self.depth_from_npy = depth_from_npy
+        self.gel_view_m = gel_view_m
 
         # 找出所有 unit：<obj>/session_*/sensor_*（找不到就退回平鋪 sensor_*）
         import glob as _glob
@@ -445,21 +509,56 @@ class sim_dataset_nested(Dataset):
                            for i in self.calib_list]
 
         depth = normal = None
-        try:
-            dmap_path = osp.join(unit, 'dmaps', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
-            depth = np.array(Image.open(dmap_path), dtype=np.float32)
-            norm_path = osp.join(unit, 'norms', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
-            normal = np.array(Image.open(norm_path), dtype=np.float32)
-        except Exception:
-            pass
+        if self.depth_from_npy:
+            try:
+                npy_path = osp.join(unit, 'raw_data',
+                                    '{0:04}{1}.npy'.format(sample_idx, self.norm_suffix))
+                depth = np.load(npy_path).astype(np.float32)
+                norm_path = osp.join(unit, 'norms', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
+                normal = np.array(Image.open(norm_path), dtype=np.float32)
+            except Exception:
+                pass
+        else:
+            try:
+                dmap_path = osp.join(unit, 'dmaps', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
+                depth = np.array(Image.open(dmap_path), dtype=np.float32)
+                norm_path = osp.join(unit, 'norms', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
+                normal = np.array(Image.open(norm_path), dtype=np.float32)
+            except Exception:
+                pass
 
+        # gel-spin rotation (before center crop, matching VisTacFusion)
+        rot_deg = 0.0
+        if self.gel_spin_max_deg > 0:
+            rot_deg = np.random.uniform(-self.gel_spin_max_deg, self.gel_spin_max_deg)
+            sample_f, calib_imgs, depth, normal = gel_spin_rotate(
+                sample_f, calib_imgs, depth, normal, rot_deg)
+
+        # fixed center crop (applied to ALL samples, train+val)
+        if self.center_crop:
+            sample_f = fixed_center_crop(sample_f)
+            calib_imgs = [fixed_center_crop(c) for c in calib_imgs]
+            if depth is not None:
+                depth = fixed_center_crop(depth)
+            if normal is not None:
+                normal = fixed_center_crop(normal)
+
+        # scale npy depth ×1000 for numerical stability (VisTacFusion convention)
+        if self.depth_from_npy and depth is not None:
+            depth = depth * 1000.0
+
+        # photometric augmentation (no geometric since gel_spin handles rotation)
         if self.tactile_aug is not None:
             sample_f, calib_imgs, depth, normal = self.tactile_aug(
                 sample_f, calib_imgs, depth, normal)
 
         sample_t = self.transforms(sample_f)
         calib_t = torch.cat([self.transforms(c) for c in calib_imgs]) if calib_imgs else torch.empty(0)
-        dmap_t = self.dmap_transforms(depth) if depth is not None else None
+
+        if self.depth_from_npy:
+            dmap_t = torch.from_numpy(depth).unsqueeze(0) if depth is not None else None
+        else:
+            dmap_t = self.dmap_transforms(depth) if depth is not None else None
         norm_t = self.norm_transforms(normal) if normal is not None else None
 
         return sample_t, calib_t, dmap_t, norm_t

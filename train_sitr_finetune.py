@@ -291,7 +291,13 @@ def parse_args():
     p.add_argument("--raw-input",         action="store_true", default=False,
                    help="Use raw tactile images without background subtraction; auto-sets calib=19")
     p.add_argument("--tactile-augment",   action="store_true", default=False,
-                   help="Tactile-specific augmentation (gain/bias/grad/noise/flip/rotate)")
+                   help="Tactile-specific augmentation (photometric: gain/bias/grad/noise)")
+    p.add_argument("--gel-spin-deg",      type=float, default=0.0,
+                   help="Gel-spin rotation aug max degrees (e.g. 180). 0=off")
+    p.add_argument("--center-crop",       action="store_true", default=False,
+                   help="Apply fixed 1/sqrt(2) center crop to all samples (train+val)")
+    p.add_argument("--depth-from-npy",    action="store_true", default=False,
+                   help="Load depth from raw_data/*.npy, compute normal from depth (VisTacFusion convention)")
     p.add_argument("--epochs",             type=int,   default=500,
                    help="Max epochs (early stopping may end sooner)")
     p.add_argument("--batch-size",         type=int,   default=64)
@@ -387,6 +393,9 @@ def main():
                 include_objects=include_objects,
                 raw_input=args.raw_input,
                 tactile_augment=augment and args.tactile_augment,
+                gel_spin_max_deg=args.gel_spin_deg,
+                center_crop=args.center_crop,
+                depth_from_npy=args.depth_from_npy,
             )
         return sim_dataset(
             path=args.data_path,

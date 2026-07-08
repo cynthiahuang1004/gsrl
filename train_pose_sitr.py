@@ -143,9 +143,17 @@ class PoseDataset(Dataset):
 
     def __init__(self, root, mesh_dir, img_xform, calibration_config=18,
                  include_objects=None, split="all", val_every=20,
-                 use_gt_norm=False, raw_input=False):
+                 use_gt_norm=False, raw_input=False,
+                 gel_spin_max_deg=0.0, center_crop=False,
+                 tactile_augment=False):
         self.root = root
         self.img_xform = img_xform
+        self.gel_spin_max_deg = gel_spin_max_deg if split == "train" else 0.0
+        self.center_crop = center_crop
+        self.tactile_augment_fn = None
+        if tactile_augment and split == "train":
+            from dataloaders import TactileAugment
+            self.tactile_augment_fn = TactileAugment()
         self.calibration_config = calibration_config
         self.raw_input = raw_input
         self.norm_suffix = "_gt" if use_gt_norm else ""
@@ -256,6 +264,25 @@ class PoseDataset(Dataset):
             calib_imgs = [(calib_raw[i - 1].astype(np.float32) - ref_f)
                           for i in self.calib_list]
 
+        # Gel-spin rotation (before center crop)
+        rot_deg = 0.0
+        if self.gel_spin_max_deg > 0:
+            from dataloaders import gel_spin_rotate
+            rot_deg = np.random.uniform(-self.gel_spin_max_deg, self.gel_spin_max_deg)
+            sample_f, calib_imgs, _, _ = gel_spin_rotate(
+                sample_f, calib_imgs, None, None, rot_deg)
+
+        # Fixed center crop
+        if self.center_crop:
+            from dataloaders import fixed_center_crop
+            sample_f = fixed_center_crop(sample_f)
+            calib_imgs = [fixed_center_crop(c) for c in calib_imgs]
+
+        # Photometric augmentation
+        if self.tactile_augment_fn is not None:
+            sample_f, calib_imgs, _, _ = self.tactile_augment_fn(
+                sample_f, calib_imgs, None, None)
+
         sample_t = self.img_xform(sample_f)
         calib_t = torch.cat([self.img_xform(c) for c in calib_imgs]) if calib_imgs else torch.empty(0)
 
@@ -268,6 +295,13 @@ class PoseDataset(Dataset):
         sx, sy = pdata["sample_x"], pdata["sample_y"]
         x_norm = (cos_rz * sx - sin_rz * sy) / max(half, 1e-8)
         y_norm = (sin_rz * sx + cos_rz * sy) / max(half, 1e-8)
+        # Adjust pose theta for gel-spin rotation (θ' = θ - φ)
+        if abs(rot_deg) > 0.01:
+            phi_rad = math.radians(rot_deg)
+            c, s = math.cos(-phi_rad), math.sin(-phi_rad)
+            cos_new = cos_rz * c - sin_rz * s
+            sin_new = sin_rz * c + cos_rz * s
+            cos_rz, sin_rz = cos_new, sin_new
         pose = torch.tensor([cos_rz, sin_rz, x_norm, y_norm], dtype=torch.float32)
 
         return {"sample": sample_t, "calibration": calib_t, "pose": pose}
@@ -448,10 +482,13 @@ def parse_args():
     p.add_argument("--encoder-weights", required=True)
     p.add_argument("--calibration-config", type=int, default=18)
     p.add_argument("--val-every", type=int, default=20)
-    p.add_argument("--pose-mode", default="classification", choices=["classification", "regression"])
+    p.add_argument("--pose-mode", default="regression", choices=["classification", "regression"])
     p.add_argument("--rot-num-bins", type=int, default=72)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--tactile-augment", action="store_true", default=False)
+    p.add_argument("--gel-spin-deg", type=float, default=0.0)
+    p.add_argument("--center-crop", action="store_true", default=False)
     p.add_argument("--kendall", action="store_true", default=False)
     p.add_argument("--w-rot",   type=float, default=1.0)
     p.add_argument("--w-trans", type=float, default=1.0)
@@ -490,11 +527,15 @@ def main():
     train_ds = PoseDataset(
         args.data_path, args.mesh_dir, img_xform,
         calibration_config=args.calibration_config,
-        split="train", val_every=args.val_every)
+        split="train", val_every=args.val_every,
+        gel_spin_max_deg=args.gel_spin_deg,
+        center_crop=args.center_crop,
+        tactile_augment=args.tactile_augment)
     val_ds = PoseDataset(
         args.data_path, args.mesh_dir, img_xform,
         calibration_config=args.calibration_config,
-        split="val", val_every=args.val_every)
+        split="val", val_every=args.val_every,
+        center_crop=args.center_crop)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
