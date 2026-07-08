@@ -543,23 +543,29 @@ class sim_dataset_nested(Dataset):
             if normal is not None:
                 normal = fixed_center_crop(normal)
 
-        # scale npy depth ×1000 for numerical stability (VisTacFusion convention)
-        if self.depth_from_npy and depth is not None:
-            depth = depth * 1000.0
-
         # photometric augmentation (no geometric since gel_spin handles rotation)
         if self.tactile_aug is not None:
             sample_f, calib_imgs, depth, normal = self.tactile_aug(
                 sample_f, calib_imgs, depth, normal)
+
+        # VisTacFusion convention:
+        #   depth  = .npy × 1000
+        #   normal = PNG / 127.5 - 1.0 → [-1, 1]
+        if self.depth_from_npy and depth is not None:
+            depth = depth * 1000.0
+            if normal is not None:
+                normal = normal / 127.5 - 1.0
 
         sample_t = self.transforms(sample_f)
         calib_t = torch.cat([self.transforms(c) for c in calib_imgs]) if calib_imgs else torch.empty(0)
 
         if self.depth_from_npy:
             dmap_t = torch.from_numpy(depth).unsqueeze(0) if depth is not None else None
+            norm_t = torch.from_numpy(np.ascontiguousarray(normal)).permute(2, 0, 1).float() \
+                     if normal is not None else None
         else:
             dmap_t = self.dmap_transforms(depth) if depth is not None else None
-        norm_t = self.norm_transforms(normal) if normal is not None else None
+            norm_t = self.norm_transforms(normal) if normal is not None else None
 
         return sample_t, calib_t, dmap_t, norm_t
 

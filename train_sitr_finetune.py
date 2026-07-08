@@ -370,12 +370,12 @@ def main():
     if is_main:
         print("Loading dataset …")
 
+    from dataloaders import imagenet_mu, imagenet_std
     if args.raw_input:
-        img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=raw_mu, std=raw_std)])
-        norm_xform = T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)])
+        img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=imagenet_mu, std=imagenet_std)])
     else:
         img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
-        norm_xform = T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)])
+    norm_xform = T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)])
 
     use_contrastive = args.lambda_scl > 0
 

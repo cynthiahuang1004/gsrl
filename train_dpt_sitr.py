@@ -411,10 +411,8 @@ def main():
     # ── dataset (sendTwo=False: single images with GT depth+normal) ──────────
     print("Loading dataset …")
 
-    if args.encoder == "dinov2":
+    if args.encoder == "dinov2" or args.raw_input:
         img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=imagenet_mu, std=imagenet_std)])
-    elif args.raw_input:
-        img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=raw_mu, std=raw_std)])
     else:
         img_xform  = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
     dmap_xform = T.Compose([T.ToTensor(), T.Normalize(mean=dmap_mu, std=dmap_std)])

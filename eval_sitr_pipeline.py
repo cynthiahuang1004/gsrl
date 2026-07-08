@@ -43,33 +43,40 @@ from dataloaders import (sim_dataset_nested, sample_mu, sample_std,
 import torchvision.transforms as T
 
 
-# ── Metrics ─────────────────────────────────────────────────────────────────
+# ── Metrics (matching VisTacFusion) ─────────────────────────────────────────
 
-def angular_error_deg(pred_norm, gt_norm):
-    """Both inputs: (B, 3, H, W), normalized pixel values [0,255]."""
-    p = pred_norm.float() / 255.0 * 2.0 - 1.0
-    g = gt_norm.float() / 255.0 * 2.0 - 1.0
-    p = F.normalize(p, dim=1)
-    g = F.normalize(g, dim=1)
-    cos_sim = (p * g).sum(dim=1).clamp(-1, 1)
-    angle = torch.acos(cos_sim) * (180.0 / math.pi)
-    return angle.mean().item(), angle.median().item()
+def _angular_error_deg(pred_normal, gt_normal):
+    """Both: (H, W, 3) unit vectors [-1,1]. Returns (mean_deg, median_deg)."""
+    p = pred_normal / (np.linalg.norm(pred_normal, axis=-1, keepdims=True) + 1e-8)
+    g = gt_normal / (np.linalg.norm(gt_normal, axis=-1, keepdims=True) + 1e-8)
+    cos_sim = np.clip((p * g).sum(axis=-1), -1, 1)
+    angles = np.degrees(np.arccos(cos_sim))
+    return float(np.mean(angles)), float(np.median(angles))
 
 
-def depth_metrics(pred, gt):
-    """Both inputs: (B, 1, H, W) unnormalized."""
-    mask = gt != 0
-    if mask.sum() == 0:
-        return {}
-    p = pred[mask].float()
-    g = gt[mask].float()
-    abs_diff = (p - g).abs()
-    mae = abs_diff.mean().item()
-    mse = (abs_diff ** 2).mean().item()
-    rmse = mse ** 0.5
-    ratio = torch.max(p / g.clamp(min=1e-6), g / p.clamp(min=1e-6))
-    d1 = (ratio < 1.25).float().mean().item() * 100
-    return {"MAE": mae, "RMSE": rmse, "MSE": mse, "delta<1.25": d1}
+def _depth_metrics(pred, gt):
+    """Both: (H, W). MSE = full-image; MAE/RMSE/delta = contact-only (gt > 0).
+    Matches VisTacFusion convention."""
+    mse_full = float(((pred - gt) ** 2).mean())
+    mask = gt > 0
+    contact = {}
+    if mask.sum() > 0:
+        p, g = pred[mask], gt[mask]
+        abs_diff = np.abs(p - g)
+        contact["MAE"] = float(abs_diff.mean())
+        contact["RMSE"] = float((abs_diff ** 2).mean()) ** 0.5
+        ratio = np.maximum(p / np.clip(g, 1e-6, None), g / np.clip(p, 1e-6, None))
+        contact["delta<1.25"] = float((ratio < 1.25).mean()) * 100
+    return {"MSE": mse_full, **contact}
+
+
+def _rotation_error_deg(pred_pose, gt_pose):
+    """pred/gt: [cos, sin, tx, ty]. Returns error in degrees."""
+    theta_pred = np.arctan2(pred_pose[1], pred_pose[0])
+    theta_gt = np.arctan2(gt_pose[1], gt_pose[0])
+    err = abs(theta_pred - theta_gt)
+    err = min(err, 2 * np.pi - err)
+    return float(np.degrees(err))
 
 
 def unnorm(tensor, mu, std):
@@ -197,6 +204,7 @@ def parse_args():
     p.add_argument("--calib-from", default=None,
                    help="Sim sensor dir to borrow calibration from (for real data)")
     p.add_argument("--num-real", type=int, default=30)
+    p.add_argument("--center-crop", action="store_true", default=False)
     return p.parse_args()
 
 
@@ -216,6 +224,7 @@ def main():
         transforms=img_xform, dmap_transforms=dmap_xform, norm_transforms=norm_xform,
         calibration_config=args.calibration_config, sendTwo=False,
         use_gt_norm=True, raw_input=False,
+        center_crop=args.center_crop,
     )
     spu = full_ds.samples_per_unit
     val_idx = [i for i in range(len(full_ds)) if (i % spu) % args.val_every == 0]
@@ -267,43 +276,83 @@ def main():
     vis_global_set = set(obj_vis_indices.values())
     print(f"  Will visualize {len(vis_global_set)} samples (1 per object)")
 
-    # ── Evaluate depth + normal ─────────────────────────────────────────────
-    print("\nEvaluating depth + normal...")
-    all_norm_mse, all_depth_mse = [], []
-    all_ang_mean, all_ang_median = [], []
-    all_depth_mae = []
-    sample_counter = 0
+    # ── Full quantitative eval (per-sample, matching VisTacFusion) ──────────
+    print("\nEvaluating (depth + normal + pose, per-sample)...")
 
-    for batch in tqdm(val_loader, desc="Eval DPT"):
+    metrics = {
+        "depth_mse": [], "depth_mae": [], "depth_rmse": [], "depth_d1": [],
+        "normal_mse": [], "normal_ang_mean": [], "normal_ang_median": [],
+        "pose_rot_deg": [], "pose_trans_l1": [],
+    }
+
+    encoder_raw = model.encoder.sitr
+    encoder_raw.eval()
+
+    # Pose dataset (for GT pose labels)
+    pose_ds = None
+    if pose_head is not None:
+        pose_ds = PoseDataset(
+            args.data_path, args.mesh_dir, img_xform,
+            calibration_config=args.calibration_config,
+            split="val", val_every=args.val_every)
+
+    sample_counter = 0
+    vis_dir = osp.join(args.save_path, "sim_val_vis")
+    os.makedirs(vis_dir, exist_ok=True)
+
+    for batch in tqdm(val_loader, desc="Eval"):
         imgs   = batch["sample"].to(device)
         calibs = batch["calibration"].to(device)
-        gt_depth = batch["dmap"].to(device)
-        gt_norm  = batch["norm"].to(device)
+        gt_depth_t = batch["dmap"]
+        gt_norm_t  = batch["norm"]
         B = imgs.size(0)
 
         with torch.no_grad(), autocast("cuda"):
             out = model(imgs, calibs)
 
-        pred_depth = out["depth"]
-        pred_norm  = out["normal"]
+        pred_depth_t = out["depth"].cpu()
+        pred_norm_t  = out["normal"].cpu()
 
-        all_norm_mse.append(F.mse_loss(pred_norm, gt_norm).item())
-        all_depth_mse.append(F.mse_loss(pred_depth, gt_depth).item())
+        # Unnormalize to pixel space
+        pred_d_un = unnorm(pred_depth_t, dmap_mu, dmap_std)
+        gt_d_un   = unnorm(gt_depth_t, dmap_mu, dmap_std)
+        pred_n_un = unnorm(pred_norm_t, norm_mu, norm_std)
+        gt_n_un   = unnorm(gt_norm_t, norm_mu, norm_std)
 
-        pred_n_un = unnorm(pred_norm.cpu(), norm_mu, norm_std)
-        gt_n_un   = unnorm(gt_norm.cpu(), norm_mu, norm_std)
-        ang_mean, ang_median = angular_error_deg(pred_n_un, gt_n_un)
-        all_ang_mean.append(ang_mean)
-        all_ang_median.append(ang_median)
-
-        pred_d_un = unnorm(pred_depth.cpu(), dmap_mu, dmap_std)
-        gt_d_un   = unnorm(gt_depth.cpu(), dmap_mu, dmap_std)
-        dm = depth_metrics(pred_d_un, gt_d_un)
-        if dm:
-            all_depth_mae.append(dm["MAE"])
-
-        # Visualizations (one per object)
         for i in range(B):
+            pd = pred_d_un[i, 0].numpy()
+            gd = gt_d_un[i, 0].numpy()
+            dm = _depth_metrics(pd, gd)
+            if dm:
+                metrics["depth_mse"].append(dm["MSE"])
+                metrics["depth_mae"].append(dm["MAE"])
+                metrics["depth_rmse"].append(dm["RMSE"])
+                metrics["depth_d1"].append(dm["delta<1.25"])
+
+            # Normal metrics (unit vectors)
+            pn = pred_n_un[i].permute(1, 2, 0).numpy() / 127.5 - 1.0
+            gn = gt_n_un[i].permute(1, 2, 0).numpy() / 127.5 - 1.0
+            nm = F.mse_loss(torch.from_numpy(pn).float(),
+                            torch.from_numpy(gn).float()).item()
+            metrics["normal_mse"].append(nm)
+            ang_mean, ang_median = _angular_error_deg(pn, gn)
+            metrics["normal_ang_mean"].append(ang_mean)
+            metrics["normal_ang_median"].append(ang_median)
+
+            # Pose metrics
+            if pose_head is not None and pose_ds is not None and sample_counter + i < len(pose_ds):
+                pose_sample = pose_ds[sample_counter + i]
+                gt_pose = pose_sample["pose"].numpy()
+                p_imgs = pose_sample["sample"].unsqueeze(0).to(device)
+                p_cals = pose_sample["calibration"].unsqueeze(0).to(device)
+                with torch.no_grad(), autocast("cuda"):
+                    latent = encoder_raw.forward_encoder(p_imgs, p_cals)
+                    pred_pose = pose_head(latent[:, 0, :], latent[:, 1:, :])
+                se2 = pred_pose["se2"][0].float().cpu().numpy()
+                metrics["pose_rot_deg"].append(_rotation_error_deg(se2, gt_pose))
+                metrics["pose_trans_l1"].append(float(np.abs(se2[2:] - gt_pose[2:]).mean()))
+
+            # Visualization (one per object)
             global_idx = val_idx[sample_counter + i]
             if global_idx in vis_global_set:
                 unit_idx = global_idx // spu
@@ -311,114 +360,64 @@ def main():
                 obj_name = osp.basename(osp.dirname(osp.dirname(unit)))
 
                 fig, axes = plt.subplots(1, 6, figsize=(24, 4))
-
                 inp = unnorm(imgs[i:i+1].cpu(), sample_mu, sample_std)
                 inp = inp[0].permute(1, 2, 0).clamp(0, 255).numpy().astype(np.uint8)
                 axes[0].imshow(inp); axes[0].set_title(f"Input [{obj_name}]")
 
-                pd = pred_d_un[i, 0].numpy()
-                gd = gt_d_un[i, 0].numpy()
                 vmin = min(pd.min(), gd.min())
                 vmax = max(pd.max(), gd.max())
                 axes[1].imshow(pd, cmap="viridis", vmin=vmin, vmax=vmax); axes[1].set_title("Pred Depth")
                 axes[2].imshow(gd, cmap="viridis", vmin=vmin, vmax=vmax); axes[2].set_title("GT Depth")
 
-                pn = pred_n_un[i].permute(1, 2, 0).clamp(0, 255).numpy().astype(np.uint8)
-                gn = gt_n_un[i].permute(1, 2, 0).clamp(0, 255).numpy().astype(np.uint8)
-                axes[3].imshow(pn); axes[3].set_title("Pred Normal")
-                axes[4].imshow(gn); axes[4].set_title("GT Normal")
+                pn_vis = ((pn * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
+                gn_vis = ((gn * 0.5 + 0.5) * 255).clip(0, 255).astype(np.uint8)
+                axes[3].imshow(pn_vis); axes[3].set_title("Pred Normal")
+                axes[4].imshow(gn_vis); axes[4].set_title("GT Normal")
 
                 err = np.abs(pd - gd)
-                axes[5].imshow(err, cmap="hot"); axes[5].set_title(f"Depth Err (MAE={err.mean():.1f})")
+                axes[5].imshow(err, cmap="hot"); axes[5].set_title(f"Depth Err (MAE={err.mean():.2f})")
 
                 for ax in axes:
                     ax.axis("off")
                 fig.tight_layout()
-                fig.savefig(osp.join(args.save_path, f"vis_{obj_name}.png"), dpi=120, bbox_inches="tight")
+                fig.savefig(osp.join(vis_dir, f"{obj_name}.png"), dpi=120, bbox_inches="tight")
                 plt.close(fig)
 
         sample_counter += B
 
-    # ── Evaluate pose ───────────────────────────────────────────────────────
-    pose_metrics = {}
-    if pose_head is not None:
-        print("\nEvaluating pose...")
-        pose_ds = PoseDataset(
-            args.data_path, args.mesh_dir, img_xform,
-            calibration_config=args.calibration_config,
-            split="val", val_every=args.val_every)
-        pose_loader = DataLoader(pose_ds, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, pin_memory=True)
+    # ── Aggregate & print (matching VisTacFusion format) ────────────────────
+    summary = {k: float(np.mean(v)) for k, v in metrics.items() if v}
 
-        encoder = model.encoder.sitr
-        encoder.eval()
-        all_rot_err, all_trans_err = [], []
-
-        for batch in tqdm(pose_loader, desc="Eval Pose"):
-            imgs   = batch["sample"].to(device)
-            calibs = batch["calibration"].to(device)
-            gt_pose = batch["pose"].to(device)
-
-            with torch.no_grad(), autocast("cuda"):
-                enc_out = encoder(imgs, calibs)
-                latent = encoder.forward_encoder(imgs, calibs)
-                cls_token = latent[:, 0, :]
-                spatial = latent[:, 1:, :]
-                pred = pose_head(cls_token, spatial)
-
-            se2 = pred["se2"].float().cpu()
-            gt = gt_pose.cpu()
-            theta_pred = torch.atan2(se2[:, 1], se2[:, 0])
-            theta_gt = torch.atan2(gt[:, 1], gt[:, 0])
-            rot_err = torch.abs(theta_pred - theta_gt)
-            rot_err = torch.min(rot_err, 2 * math.pi - rot_err) * 180 / math.pi
-            all_rot_err.append(rot_err)
-            all_trans_err.append((se2[:, 2:] - gt[:, 2:]).abs().mean(dim=1))
-
-        all_rot_err = torch.cat(all_rot_err)
-        all_trans_err = torch.cat(all_trans_err)
-        pose_metrics = {
-            "Rotation Error Mean (deg)": all_rot_err.mean().item(),
-            "Rotation Error Median (deg)": all_rot_err.median().item(),
-            "Translation Error Mean": all_trans_err.mean().item(),
-        }
-
-    # ── Print results ───────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("SITR Pipeline Evaluation Results")
     print("=" * 60)
 
-    dpt_metrics = {
-        "Normal MSE (normalized)": np.mean(all_norm_mse),
-        "Depth MSE (normalized)": np.mean(all_depth_mse),
-        "Angular Error Mean (deg)": np.mean(all_ang_mean),
-        "Angular Error Median (deg)": np.mean(all_ang_median),
-        "Depth MAE (mm)": np.mean(all_depth_mae) if all_depth_mae else float("nan"),
-    }
-
-    print("\n  [Depth + Normal]")
-    for k, v in dpt_metrics.items():
-        print(f"    {k:35s} {v:.4f}")
-
-    if pose_metrics:
-        print("\n  [Pose]")
-        for k, v in pose_metrics.items():
-            print(f"    {k:35s} {v:.4f}")
-
-    # Save metrics
-    all_metrics = {**dpt_metrics, **pose_metrics}
-    report_path = osp.join(args.save_path, "metrics.txt")
+    report_path = osp.join(args.save_path, "eval_metrics.txt")
     with open(report_path, "w") as f:
-        f.write("SITR Pipeline Evaluation\n")
+        f.write("SITR Pipeline Evaluation Results\n")
         f.write(f"Encoder: {args.encoder_weights}\n")
         f.write(f"DPT: {args.dpt_weights}\n")
         if args.pose_weights:
             f.write(f"Pose: {args.pose_weights}\n")
         f.write(f"Val samples: {len(val_ds)}\n\n")
-        for k, v in all_metrics.items():
-            f.write(f"{k}: {v:.6f}\n")
-    print(f"\nMetrics saved -> {report_path}")
-    print(f"Visualizations saved -> {args.save_path}/")
+
+        f.write("[tactile]\n")
+        f.write(f"  Depth MSE:               {summary.get('depth_mse', float('nan')):.6f}\n")
+        f.write(f"  Depth MAE:               {summary.get('depth_mae', float('nan')):.6f}\n")
+        f.write(f"  Depth RMSE:              {summary.get('depth_rmse', float('nan')):.6f}\n")
+        f.write(f"  Depth delta<1.25 (%):    {summary.get('depth_d1', float('nan')):.2f}\n")
+        f.write(f"  Normal MSE:              {summary.get('normal_mse', float('nan')):.6f}\n")
+        f.write(f"  Normal Ang Mean (deg):   {summary.get('normal_ang_mean', float('nan')):.2f}\n")
+        f.write(f"  Normal Ang Median (deg): {summary.get('normal_ang_median', float('nan')):.2f}\n")
+        f.write(f"  Pose Rot Error (deg):    {summary.get('pose_rot_deg', float('nan')):.2f}\n")
+        f.write(f"  Pose Trans L1:           {summary.get('pose_trans_l1', float('nan')):.6f}\n")
+
+    # Also print to console
+    with open(report_path) as f:
+        print(f.read())
+
+    print(f"Metrics saved -> {report_path}")
+    print(f"Visualizations saved -> {vis_dir}/")
 
     # ── Real data eval (qualitative) ────────────────────────────────────────
     if args.real_dir:

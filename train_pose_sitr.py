@@ -520,7 +520,11 @@ def main():
     os.makedirs(args.save_path, exist_ok=True)
 
     import torchvision.transforms as T
-    img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
+    from dataloaders import imagenet_mu, imagenet_std
+    if args.calibration_config == 0:
+        img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=imagenet_mu, std=imagenet_std)])
+    else:
+        img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
 
     # ── dataset ─────────────────────────────────────────────────────────────
     print("Loading datasets...")
