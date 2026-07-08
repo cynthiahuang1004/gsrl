@@ -669,8 +669,11 @@ def main():
             args.lambda_depth, args.lambda_normal,
             device, args.amp, log_vars=log_vars,
         )
+        # Use raw MSE sum for scheduler/early-stop (not Kendall total which drifts negative)
+        val_metric = val_depth + val_normal
+
         if args.scheduler == "plateau":
-            scheduler.step(val_loss)
+            scheduler.step(val_metric)
         else:
             scheduler.step()
 
@@ -682,13 +685,13 @@ def main():
         print(f"  → train={train_loss:.4f}  depth={l_depth:.4f}"
               f"  normal={l_normal:.4f}{kd_str}")
         print(f"  → val={val_loss:.4f}    v_depth={val_depth:.4f}"
-              f"  v_normal={val_normal:.4f}")
+              f"  v_normal={val_normal:.4f}  monitor={val_metric:.4f}")
 
         history["epochs"].append(epoch)
         history["train_loss"].append(train_loss)
         history["l_depth"].append(l_depth)
         history["l_normal"].append(l_normal)
-        history["val_loss"].append(val_loss)
+        history["val_loss"].append(val_metric)
         history["lr"].append(current_lr)
 
         with open(log_path, "a") as f:
@@ -713,8 +716,8 @@ def main():
                 ckpt_dict["encoder"] = model.encoder.sitr.state_dict()
             torch.save(ckpt_dict, path)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metric < best_val_loss:
+            best_val_loss = val_metric
             epochs_no_improve = 0
             save_ckpt(os.path.join(args.save_path, "best.pth"))
             print(f"  ✓ best val_loss={best_val_loss:.4f}  →  best.pth")
