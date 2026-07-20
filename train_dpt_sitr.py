@@ -401,8 +401,9 @@ def main():
         args.calibration_config = 0
         args.unfreeze_encoder_layers = 0
 
-    if args.raw_input and args.calibration_config == 18:
-        args.calibration_config = 19
+    if args.raw_input and args.calibration_config not in (0,):
+        print(f"  [warn] raw_input=True with calib={args.calibration_config}; "
+              f"make sure encoder weights match this config")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -486,21 +487,9 @@ def main():
         val_ds_noaug = build_dataset(augment=False)
         val_ds_noaug = torch.utils.data.Subset(val_ds_noaug, val_ds.indices)
 
-    # ── RAM cache ─────────────────────────────────────────────────────────────
-    has_tactile_aug = hasattr(train_ds, 'tactile_aug') and train_ds.tactile_aug is not None
-    if not args.no_cache:
-        print("Pre-loading data into RAM …")
-        if has_tactile_aug:
-            print("  Train: tactile augmentation enabled → no cache (fresh augments each epoch)")
-            train_workers = args.num_workers
-        else:
-            train_ds = CachedDataset(train_ds, desc="Train")
-            train_workers = 0
-        val_ds_noaug = CachedDataset(val_ds_noaug, desc="Val")
-        val_workers = 0
-    else:
-        train_workers = args.num_workers
-        val_workers = args.num_workers
+    # ── workers ────────────────────────────────────────────────────────────
+    train_workers = args.num_workers
+    val_workers = args.num_workers
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -652,11 +641,10 @@ def main():
     else:
         print(f"Loss weights: depth={args.lambda_depth}"
               f"  normal={args.lambda_normal}  grad={args.lambda_grad}")
-    print(f"Augmentation: {'tactile (gain/bias/grad/noise/flip/rotate)' if has_tactile_aug else 'standard'}")
+    print(f"Augmentation: {'tactile (gain/bias/grad/noise/flip/rotate)' if args.tactile_augment else 'standard'}")
+    print(f"  gel_spin={args.gel_spin_deg}°  center_crop={args.center_crop}  depth_from_npy={args.depth_from_npy}")
     print(f"Regularisation: weight_decay={args.weight_decay}  dropout={args.dropout}")
     print(f"Scheduler: {args.scheduler}  early_stop={args.early_stop}")
-    print(f"RAM cache: train={'OFF (augment)' if has_tactile_aug else 'ON'}"
-          f"  val={'OFF' if args.no_cache else 'ON'}")
     print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):

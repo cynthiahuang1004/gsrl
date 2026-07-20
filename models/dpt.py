@@ -220,10 +220,40 @@ class SITRWithDPT(nn.Module):
                                       unfreeze_last_n=unfreeze_last_n)
         self.decoder = DPTDecoder(embed_dim, features, dropout=dropout)
 
-    def forward(self, x, c):
+    def forward(self, x, c, return_latent=False):
         features = self.encoder(x, c)
         depth, normal = self.decoder(features)
-        return {"depth": depth, "normal": normal}
+        out = {"depth": depth, "normal": normal}
+        if return_latent:
+            out["latent"] = features[-1]
+        return out
+
+    def forward_encoder_full(self, x, c):
+        """Run encoder once, return (multi_scale_features, full_latent).
+        full_latent includes cls+patch tokens for pose head."""
+        s = self.encoder.sitr
+        x_enc = s.patch_embed(x)
+        x_enc = x_enc + s.pos_embed[:, 1:, :]
+        cls_token = s.cls_token + s.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x_enc.shape[0], -1, -1)
+        x_enc = torch.cat((cls_tokens, x_enc), dim=1)
+        num_patches = s.patch_embed.num_patches
+        if s.num_calibration > 0:
+            c_enc = s.c_patch_embed(c)
+            c_enc = c_enc + s.c_pos_embed
+            x_enc = torch.cat((x_enc, c_enc), dim=1)
+        features = []
+        for i, blk in enumerate(s.blocks):
+            with torch.no_grad():
+                x_enc = blk(x_enc)
+            if i in self.encoder.layer_indices:
+                features.append(x_enc[:, 1:num_patches + 1, :])
+        x_enc = s.norm(x_enc)
+        if s.num_calibration > 0:
+            latent = x_enc[:, :num_patches + 1, :]
+        else:
+            latent = x_enc
+        return features, latent
 
 
 class DINOv2MultiScale(nn.Module):

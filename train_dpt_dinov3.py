@@ -1,17 +1,25 @@
 """
-train_dpt_dinov3.py — Train DPT decoder on frozen DINOv3 encoder (local server)
+train_dpt_dinov3.py — Train DPT decoder on frozen DINOv3 encoder
+
+Aligned with VisTacFusion:
+  - Augmentation: photometric + gel-spin ±180° + center crop 1/√2
+  - Depth GT: .npy × 1000
+  - Normal GT: rendered PNG / 127.5 - 1.0 → [-1, 1]
+  - Input: raw image, ImageNet normalization
+  - Loss: MSE + optional Kendall uncertainty weighting
+  - Eval: val_depth + val_normal (raw MSE sum) for early stopping
 
 Usage:
-  python train_dpt_dinov3.py --device cuda:1
-
-  # Resume from checkpoint:
-  python train_dpt_dinov3.py --device cuda:1 --resume output_checkpoints/dpt_dinov3_v2/latest.pth
+  python train_dpt_dinov3.py \
+    --dinov3-weights path/to/dinov3_vitl16_pretrain.pth \
+    --save-path output_checkpoints/20260709_dpt_dinov3 \
+    --device cuda:2 --raw-input --gel-spin-deg 180 --center-crop \
+    --depth-from-npy --kendall --lr 2e-4
 """
 import argparse
 import os
 import os.path as osp
 import time
-import glob as _glob
 
 import numpy as np
 import torch
@@ -19,7 +27,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from PIL import Image
 from tqdm import tqdm
 
 import matplotlib
@@ -27,11 +34,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from dataloaders import (
-    sim_dataset_nested, TactileAugment,
+    sim_dataset_nested,
     sample_mu, sample_std, norm_mu, norm_std,
     dmap_mu, dmap_std, imagenet_mu, imagenet_std,
 )
 from models.dpt import DINOv3WithDPT
+import torchvision.transforms as T
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -80,19 +88,6 @@ class WarmupThenPlateau:
         self._epoch = d["epoch"]; self.plateau.load_state_dict(d["plateau"])
 
 
-class ToTensorNorm:
-    """float32 HWC ndarray -> normalised CHW tensor (handles 2-D depth maps too)."""
-    def __init__(self, mean, std):
-        self.mean = torch.tensor(mean).view(-1, 1, 1)
-        self.std  = torch.tensor(std).view(-1, 1, 1)
-    def __call__(self, arr):
-        t = torch.from_numpy(np.ascontiguousarray(arr)).float()
-        if t.ndim == 2:
-            t = t.unsqueeze(-1)
-        t = t.permute(2, 0, 1)
-        return (t - self.mean) / self.std
-
-
 def gradient_loss(pred, gt):
     return (F.l1_loss(pred[:, :, :, 1:] - pred[:, :, :, :-1],
                       gt[:, :, :, 1:]  - gt[:, :, :, :-1]) +
@@ -103,23 +98,29 @@ def gradient_loss(pred, gt):
 # ── train / val ─────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, optimizer, scaler,
-                    depth_crit, normal_crit, args, device, epoch):
+                    depth_crit, normal_crit, args, device, epoch,
+                    log_vars=None):
     model.train()
     loss_m, depth_m, norm_m = AverageMeter(), AverageMeter(), AverageMeter()
     t0 = time.time()
     for step, batch in enumerate(loader):
         imgs     = batch["sample"].to(device, non_blocking=True)
-        calibs   = batch["calibration"].to(device, non_blocking=True)
         gt_depth = batch["dmap"].to(device, non_blocking=True)
         gt_norm  = batch["norm"].to(device, non_blocking=True)
         B = imgs.size(0)
 
         optimizer.zero_grad()
         with autocast("cuda", enabled=args.amp):
-            out = model(imgs, calibs)
+            out = model(imgs)
             l_d = depth_crit(out["depth"], gt_depth)
             l_n = normal_crit(out["normal"], gt_norm)
-            loss = args.lambda_depth * l_d + args.lambda_normal * l_n
+
+            if log_vars is not None:
+                loss = (torch.exp(-log_vars[0]) * l_d + log_vars[0] +
+                        torch.exp(-log_vars[1]) * l_n + log_vars[1])
+            else:
+                loss = args.lambda_depth * l_d + args.lambda_normal * l_n
+
             if args.lambda_grad > 0:
                 loss = loss + args.lambda_grad * gradient_loss(out["depth"], gt_depth)
 
@@ -134,26 +135,33 @@ def train_one_epoch(model, loader, optimizer, scaler,
         norm_m.update(l_n.item(), B)
 
         if step % 50 == 0:
+            kd = ""
+            if log_vars is not None:
+                kd = f"  w_d={torch.exp(-log_vars[0]).item():.2f}  w_n={torch.exp(-log_vars[1]).item():.2f}"
             print(f"  [epoch {epoch:03d} | step {step:04d}/{len(loader):04d}]"
                   f"  loss={loss_m.avg:.4f}  depth={depth_m.avg:.4f}"
-                  f"  normal={norm_m.avg:.4f}  ({time.time()-t0:.1f}s)")
+                  f"  normal={norm_m.avg:.4f}{kd}  ({time.time()-t0:.1f}s)")
     return loss_m.avg, depth_m.avg, norm_m.avg
 
 
 @torch.no_grad()
-def validate(model, loader, depth_crit, normal_crit, args, device):
+def validate(model, loader, depth_crit, normal_crit, args, device,
+             log_vars=None):
     model.eval()
     loss_m, depth_m, norm_m = AverageMeter(), AverageMeter(), AverageMeter()
     for batch in loader:
         imgs     = batch["sample"].to(device, non_blocking=True)
-        calibs   = batch["calibration"].to(device, non_blocking=True)
         gt_depth = batch["dmap"].to(device, non_blocking=True)
         gt_norm  = batch["norm"].to(device, non_blocking=True)
         with autocast("cuda", enabled=args.amp):
-            out = model(imgs, calibs)
+            out = model(imgs)
             l_d = depth_crit(out["depth"], gt_depth)
             l_n = normal_crit(out["normal"], gt_norm)
-            loss = args.lambda_depth * l_d + args.lambda_normal * l_n
+            if log_vars is not None:
+                loss = (torch.exp(-log_vars[0]) * l_d + log_vars[0] +
+                        torch.exp(-log_vars[1]) * l_n + log_vars[1])
+            else:
+                loss = args.lambda_depth * l_d + args.lambda_normal * l_n
         loss_m.update(loss.item(), imgs.size(0))
         depth_m.update(l_d.item(), imgs.size(0))
         norm_m.update(l_n.item(), imgs.size(0))
@@ -191,24 +199,28 @@ def plot_loss_curves(history, save_path):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-path", default="/media/hdd2/ihsuan/gelslim_depth/datasets/renders")
-    p.add_argument("--val-objects", nargs="+", default=["edge", "hex_key", "pattern_31_rod"])
-    p.add_argument("--gt-norm", action="store_true", default=True)
+    p.add_argument("--data-path", default="/media/hdd2/ihsuan/gs_blender/renders")
+    p.add_argument("--val-every", type=int, default=20)
     p.add_argument("--dinov3-model", default="dinov3_vitl16")
     p.add_argument("--dinov3-weights",
                    default="output_checkpoints/dpt_dinov3/dinov3_vitl16_pretrain_lvd1689m.pth")
     p.add_argument("--dpt-features", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--tactile-augment", action="store_true", default=True)
+    p.add_argument("--tactile-augment", action="store_true", default=False)
+    p.add_argument("--gel-spin-deg", type=float, default=0.0)
+    p.add_argument("--center-crop", action="store_true", default=False)
+    p.add_argument("--depth-from-npy", action="store_true", default=False)
+    p.add_argument("--raw-input", action="store_true", default=False)
     p.add_argument("--lambda-depth",  type=float, default=1.0)
     p.add_argument("--lambda-normal", type=float, default=1.0)
     p.add_argument("--lambda-grad",   type=float, default=0.0)
+    p.add_argument("--kendall", action="store_true", default=False)
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--min-lr", type=float, default=1e-6)
     p.add_argument("--warmup-epochs", type=int, default=5)
-    p.add_argument("--weight-decay", type=float, default=0.1)
+    p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--plateau-patience", type=int, default=10)
     p.add_argument("--plateau-factor", type=float, default=0.5)
     p.add_argument("--early-stop", type=int, default=30)
@@ -217,7 +229,7 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--save-path", default="output_checkpoints/dpt_dinov3_v2")
+    p.add_argument("--save-path", default="output_checkpoints/dpt_dinov3")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--resume", default=None)
     return p.parse_args()
@@ -231,43 +243,49 @@ def main():
     os.makedirs(args.save_path, exist_ok=True)
 
     # ── transforms ──────────────────────────────────────────────────────────
-    img_xform  = ToTensorNorm(imagenet_mu, imagenet_std)
-    dmap_xform = ToTensorNorm(dmap_mu, dmap_std)
-    norm_xform = ToTensorNorm(norm_mu, norm_std)
+    if args.raw_input:
+        img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=imagenet_mu, std=imagenet_std)])
+    else:
+        img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
+    dmap_xform = T.Compose([T.ToTensor(), T.Normalize(mean=dmap_mu, std=dmap_std)])
+    norm_xform = T.Compose([T.ToTensor(), T.Normalize(mean=norm_mu, std=norm_std)])
 
-    # ── dataset ─────────────────────────────────────────────────────────────
-    all_objs = sorted({
-        osp.basename(osp.dirname(osp.dirname(p)))
-        for p in _glob.glob(osp.join(args.data_path, "*", "session_*", "sensor_*"))
-    })
-    val_objs   = args.val_objects
-    train_objs = [o for o in all_objs if o not in set(val_objs)]
-    print(f"Train objects ({len(train_objs)}): {train_objs}")
-    print(f"Val objects   ({len(val_objs)}):   {val_objs}")
+    # ── dataset (per-session split, matching VisTacFusion) ──────────────────
+    print("Loading dataset...")
 
-    def build_ds(augment, objects):
+    def build_ds(augment):
         return sim_dataset_nested(
             path=args.data_path, augment=augment,
             transforms=img_xform, dmap_transforms=dmap_xform, norm_transforms=norm_xform,
             calibration_config=0, sendTwo=False,
-            use_gt_norm=args.gt_norm, include_objects=objects,
-            raw_input=True,
+            use_gt_norm=True, raw_input=args.raw_input,
             tactile_augment=augment and args.tactile_augment,
+            gel_spin_max_deg=args.gel_spin_deg,
+            center_crop=args.center_crop,
+            depth_from_npy=args.depth_from_npy,
         )
 
-    train_ds = build_ds(True,  train_objs)
-    val_ds   = build_ds(False, val_objs)
+    full_aug   = build_ds(augment=True)
+    full_noaug = build_ds(augment=False)
+    spu = full_aug.samples_per_unit
+    all_idx = list(range(len(full_aug)))
+    train_idx = [i for i in all_idx if (i % spu) % args.val_every != 0]
+    val_idx   = [i for i in all_idx if (i % spu) % args.val_every == 0]
+    train_ds = torch.utils.data.Subset(full_aug, train_idx)
+    val_ds   = torch.utils.data.Subset(full_noaug, val_idx)
+    print(f"  Per-session split: val_every={args.val_every} "
+          f"({len(val_idx)}/{len(all_idx)} val, {len(train_idx)}/{len(all_idx)} train)")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
                               persistent_workers=(args.num_workers > 0),
                               prefetch_factor=4 if args.num_workers > 0 else None)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True,
-                              persistent_workers=(args.num_workers > 0),
-                              prefetch_factor=4 if args.num_workers > 0 else None)
-    print(f"Train: {len(train_ds):,} samples ({len(train_loader)} batches)")
-    print(f"Val:   {len(val_ds):,} samples ({len(val_loader)} batches)")
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True,
+                            persistent_workers=(args.num_workers > 0),
+                            prefetch_factor=4 if args.num_workers > 0 else None)
+    print(f"  Train: {len(train_ds):,} samples ({len(train_loader)} batches)")
+    print(f"  Val:   {len(val_ds):,} samples ({len(val_loader)} batches)")
 
     # ── model ───────────────────────────────────────────────────────────────
     print(f"\nBuilding DINOv3 encoder ({args.dinov3_model})...")
@@ -279,13 +297,23 @@ def main():
     enc_p = sum(p.numel() for p in model.encoder.parameters())
     dec_p = sum(p.numel() for p in model.decoder.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Encoder: {enc_p/1e6:.1f}M (frozen)  Decoder: {dec_p/1e6:.1f}M  Trainable: {trainable/1e6:.1f}M")
+    print(f"  Encoder: {enc_p/1e6:.1f}M (frozen)  Decoder: {dec_p/1e6:.1f}M  Trainable: {trainable/1e6:.1f}M")
 
     # ── optimizer ───────────────────────────────────────────────────────────
     depth_crit  = nn.MSELoss()
     normal_crit = nn.MSELoss()
+
+    log_vars = None
+    if args.kendall:
+        log_vars = nn.Parameter(torch.zeros(2, device=device))
+        print("  Kendall uncertainty weighting: ON (learned task weights)")
+
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+    if log_vars is not None:
+        trainable_params.append(log_vars)
+
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        trainable_params,
         lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
     scheduler = WarmupThenPlateau(
         optimizer, args.warmup_epochs, warmup_lr=1e-6, base_lr=args.lr,
@@ -304,7 +332,9 @@ def main():
         scaler.load_state_dict(ck["scaler"])
         start_epoch = ck["epoch"] + 1
         best_val_loss = ck.get("best_val_loss", float("inf"))
-        print(f"Resumed from epoch {start_epoch}, best_val={best_val_loss:.4f}")
+        if "log_vars" in ck and log_vars is not None:
+            log_vars.data = ck["log_vars"]
+        print(f"  Resumed from epoch {start_epoch}, best_val={best_val_loss:.4f}")
 
     # ── training loop ───────────────────────────────────────────────────────
     log_path = osp.join(args.save_path, "train_log.csv")
@@ -317,10 +347,14 @@ def main():
 
     epochs_no_improve = 0
 
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print(f"DPT Training | encoder={args.dinov3_model}  epochs={args.epochs}")
     print(f"  bs={args.batch_size}  lr={args.lr}  dropout={args.dropout}  wd={args.weight_decay}")
-    print(f"  augment={args.tactile_augment}  early_stop={args.early_stop}  device={args.device}")
+    input_mode = "RAW (ImageNet norm)" if args.raw_input else "DIFF (bg-sub)"
+    print(f"  input={input_mode}  calib=0  gel_spin={args.gel_spin_deg}°  center_crop={args.center_crop}")
+    loss_str = "Kendall (learned)" if args.kendall else f"depth={args.lambda_depth} normal={args.lambda_normal}"
+    print(f"  loss: {loss_str}  grad={args.lambda_grad}  depth_from_npy={args.depth_from_npy}")
+    print(f"  early_stop={args.early_stop}  device={args.device}")
     print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
@@ -329,21 +363,28 @@ def main():
 
         train_loss, l_depth, l_normal = train_one_epoch(
             model, train_loader, optimizer, scaler,
-            depth_crit, normal_crit, args, device, epoch)
+            depth_crit, normal_crit, args, device, epoch, log_vars=log_vars)
 
         val_loss, val_depth, val_normal = validate(
-            model, val_loader, depth_crit, normal_crit, args, device)
+            model, val_loader, depth_crit, normal_crit, args, device,
+            log_vars=log_vars)
 
-        scheduler.step(val_loss)
+        val_metric = val_depth + val_normal
+        scheduler.step(val_metric)
 
-        print(f"  train={train_loss:.4f}  depth={l_depth:.4f}  normal={l_normal:.4f}")
-        print(f"  val={val_loss:.4f}  v_depth={val_depth:.4f}  v_normal={val_normal:.4f}")
+        kd_str = ""
+        if log_vars is not None:
+            w_d = torch.exp(-log_vars[0]).item()
+            w_n = torch.exp(-log_vars[1]).item()
+            kd_str = f"  (kendall w_depth={w_d:.3f} w_normal={w_n:.3f})"
+        print(f"  → train={train_loss:.4f}  depth={l_depth:.4f}  normal={l_normal:.4f}{kd_str}")
+        print(f"  → val={val_loss:.4f}  v_depth={val_depth:.4f}  v_normal={val_normal:.4f}  monitor={val_metric:.4f}")
 
         history["epochs"].append(epoch)
         history["train_loss"].append(train_loss)
         history["l_depth"].append(l_depth)
         history["l_normal"].append(l_normal)
-        history["val_loss"].append(val_loss)
+        history["val_loss"].append(val_metric)
         history["lr"].append(lr)
 
         with open(log_path, "a") as f:
@@ -351,7 +392,7 @@ def main():
                     f"{val_loss:.6f},{val_depth:.6f},{val_normal:.6f},{lr:.2e}\n")
 
         def save_ckpt(path):
-            torch.save({
+            d = {
                 "epoch": epoch,
                 "decoder": model.decoder.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -359,10 +400,13 @@ def main():
                 "scaler": scaler.state_dict(),
                 "best_val_loss": best_val_loss,
                 "args": vars(args),
-            }, path)
+            }
+            if log_vars is not None:
+                d["log_vars"] = log_vars.data
+            torch.save(d, path)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metric < best_val_loss:
+            best_val_loss = val_metric
             epochs_no_improve = 0
             save_ckpt(osp.join(args.save_path, "best.pth"))
             print(f"  >>> best val_loss={best_val_loss:.4f} -> best.pth")
