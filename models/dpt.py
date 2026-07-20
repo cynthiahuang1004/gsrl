@@ -46,6 +46,10 @@ class SITRMultiScale(nn.Module):
             self.sitr.norm.train(mode)
         return self
 
+    def cache_calibration(self, c):
+        """Delegate to underlying SITR encoder."""
+        self.sitr.cache_calibration(c)
+
     def forward(self, x, c):
         s = self.sitr
 
@@ -58,7 +62,9 @@ class SITRMultiScale(nn.Module):
 
         num_patches = s.patch_embed.num_patches
 
-        if s.num_calibration > 0:
+        if s._calib_cache is not None:
+            x = torch.cat((x, s._calib_cache.expand(x.shape[0], -1, -1)), dim=1)
+        elif s.num_calibration > 0:
             c = s.c_patch_embed(c)
             c = c + s.c_pos_embed
             x = torch.cat((x, c), dim=1)
@@ -238,7 +244,9 @@ class SITRWithDPT(nn.Module):
         cls_tokens = cls_token.expand(x_enc.shape[0], -1, -1)
         x_enc = torch.cat((cls_tokens, x_enc), dim=1)
         num_patches = s.patch_embed.num_patches
-        if s.num_calibration > 0:
+        if s._calib_cache is not None:
+            x_enc = torch.cat((x_enc, s._calib_cache.expand(x_enc.shape[0], -1, -1)), dim=1)
+        elif s.num_calibration > 0:
             c_enc = s.c_patch_embed(c)
             c_enc = c_enc + s.c_pos_embed
             x_enc = torch.cat((x_enc, c_enc), dim=1)

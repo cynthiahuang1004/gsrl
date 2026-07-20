@@ -120,8 +120,15 @@ class SITR(nn.Module):
         self.decoder_pred = nn.Linear(embed_dim, patch_size**2 * in_chans, bias=True) 
         self.contrastive_head = nn.Linear(embed_dim, 128)
 
+        self._calib_cache = None
         self.initialize_weights()
-        
+
+    @torch.no_grad()
+    def cache_calibration(self, c):
+        """Pre-compute calibration embeddings once. c: (1, C, H, W)."""
+        if self.num_calibration > 0:
+            self._calib_cache = self.c_patch_embed(c) + self.c_pos_embed
+
     def freeze_projection(self):
         """Freeze all model parameters."""
         for param in self.parameters():
@@ -192,7 +199,9 @@ class SITR(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         
         # Process calibration data if available
-        if self.num_calibration > 0:
+        if self._calib_cache is not None:
+            x = torch.cat((x, self._calib_cache.expand(x.shape[0], -1, -1)), dim=1)
+        elif self.num_calibration > 0:
             c = self.c_patch_embed(c)
             c = c + self.c_pos_embed
             x = torch.cat((x, c), dim=1)

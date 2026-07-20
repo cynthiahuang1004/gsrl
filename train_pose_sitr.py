@@ -145,7 +145,7 @@ class PoseDataset(Dataset):
                  include_objects=None, split="all", val_every=20,
                  use_gt_norm=False, raw_input=False,
                  gel_spin_max_deg=0.0, center_crop=False,
-                 tactile_augment=False):
+                 tactile_augment=False, shared_obj_map=None):
         self.root = root
         self.img_xform = img_xform
         self.gel_spin_max_deg = gel_spin_max_deg if split == "train" else 0.0
@@ -158,6 +158,7 @@ class PoseDataset(Dataset):
         self.raw_input = raw_input
         self.norm_suffix = "_gt" if use_gt_norm else ""
         self._calib_cache = {}
+        self.skip_calibration = False
 
         if calibration_config == 0:    self.calib_list = []
         elif calibration_config == 18: self.calib_list = list(range(1, 19))
@@ -207,6 +208,10 @@ class PoseDataset(Dataset):
 
         self.objects = sorted({osp.basename(osp.dirname(osp.dirname(u)))
                                for u in self.unit_meta})
+        if shared_obj_map is not None:
+            self._obj_to_id = shared_obj_map
+        else:
+            self._obj_to_id = {o: i for i, o in enumerate(self.objects)}
         if not self.samples:
             raise RuntimeError(f"No samples found under {root}")
         print(f"  PoseDataset [{split}]: {len(self.samples)} samples, "
@@ -249,16 +254,23 @@ class PoseDataset(Dataset):
     def __getitem__(self, index):
         unit, sample_idx = self.samples[index]
         meta = self.unit_meta[unit]
-        ref_img, calib_raw = self._get_calib(unit)
 
         sample = np.array(Image.open(
             osp.join(unit, "samples", f"{sample_idx:04d}.png")))
 
-        if self.raw_input:
+        if self.skip_calibration:
+            ref_img, _ = self._get_calib(unit)
+            sample_f = sample.astype(np.float32)
+            if not self.raw_input:
+                sample_f = sample_f - ref_img.astype(np.float32)
+            calib_imgs = []
+        elif self.raw_input:
+            ref_img, calib_raw = self._get_calib(unit)
             sample_f = sample.astype(np.float32)
             all_imgs = [ref_img.astype(np.float32)] + [c.astype(np.float32) for c in calib_raw]
             calib_imgs = [all_imgs[i] for i in self.calib_list]
         else:
+            ref_img, calib_raw = self._get_calib(unit)
             ref_f = ref_img.astype(np.float32)
             sample_f = sample.astype(np.float32) - ref_f
             calib_imgs = [(calib_raw[i - 1].astype(np.float32) - ref_f)
@@ -304,7 +316,11 @@ class PoseDataset(Dataset):
             cos_rz, sin_rz = cos_new, sin_new
         pose = torch.tensor([cos_rz, sin_rz, x_norm, y_norm], dtype=torch.float32)
 
-        return {"sample": sample_t, "calibration": calib_t, "pose": pose}
+        obj_name = osp.basename(osp.dirname(osp.dirname(unit)))
+        obj_id = self._obj_to_id[obj_name]
+
+        return {"sample": sample_t, "calibration": calib_t, "pose": pose,
+                "object": obj_id}
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -384,7 +400,7 @@ def plot_loss_curves(history, save_path):
 
 def train_one_epoch(encoder, pose_head, loader, optimizer, scaler,
                     pose_loss_fn, w_rot, w_trans, device, amp_enabled, epoch,
-                    log_vars=None):
+                    log_vars=None, obj_embedding=None):
     pose_head.train()
     loss_m, rot_m, trans_m = AverageMeter(), AverageMeter(), AverageMeter()
     t0 = time.time()
@@ -399,8 +415,13 @@ def train_one_epoch(encoder, pose_head, loader, optimizer, scaler,
         with autocast("cuda", enabled=amp_enabled):
             with torch.no_grad():
                 enc_out = encoder(imgs, calibs)
-            cls_token = enc_out["latent"][:, 0, :]
-            spatial = enc_out["latent"][:, 1:, :]
+            latent = enc_out["latent"]
+            if obj_embedding is not None and "object" in batch:
+                obj_ids = batch["object"].to(device, non_blocking=True)
+                obj_emb = obj_embedding(obj_ids).unsqueeze(1)
+                latent = latent + obj_emb
+            cls_token = latent[:, 0, :]
+            spatial = latent[:, 1:, :]
             pred = pose_head(cls_token, spatial)
             l_rot, l_trans = pose_loss_fn(pred, gt_pose)
 
@@ -433,7 +454,7 @@ def train_one_epoch(encoder, pose_head, loader, optimizer, scaler,
 
 @torch.no_grad()
 def validate(encoder, pose_head, loader, pose_loss_fn, w_rot, w_trans,
-             device, amp_enabled, log_vars=None):
+             device, amp_enabled, log_vars=None, obj_embedding=None):
     pose_head.eval()
     loss_m, rot_m, trans_m = AverageMeter(), AverageMeter(), AverageMeter()
     all_se2_pred, all_se2_gt = [], []
@@ -445,8 +466,13 @@ def validate(encoder, pose_head, loader, pose_loss_fn, w_rot, w_trans,
 
         with autocast("cuda", enabled=amp_enabled):
             enc_out = encoder(imgs, calibs)
-            cls_token = enc_out["latent"][:, 0, :]
-            spatial = enc_out["latent"][:, 1:, :]
+            latent = enc_out["latent"]
+            if obj_embedding is not None and "object" in batch:
+                obj_ids = batch["object"].to(device, non_blocking=True)
+                obj_emb = obj_embedding(obj_ids).unsqueeze(1)
+                latent = latent + obj_emb
+            cls_token = latent[:, 0, :]
+            spatial = latent[:, 1:, :]
             pred = pose_head(cls_token, spatial)
             l_rot, l_trans = pose_loss_fn(pred, gt_pose)
             if log_vars is not None:
@@ -489,6 +515,11 @@ def parse_args():
     p.add_argument("--tactile-augment", action="store_true", default=False)
     p.add_argument("--gel-spin-deg", type=float, default=0.0)
     p.add_argument("--center-crop", action="store_true", default=False)
+    p.add_argument("--use-obj-emb", action="store_true", default=True,
+                   help="Add object embedding conditioning (matches VisTacFusion)")
+    p.add_argument("--no-obj-emb", dest="use_obj_emb", action="store_false")
+    p.add_argument("--num-objects", type=int, default=20,
+                   help="Number of object classes for embedding table")
     p.add_argument("--kendall", action="store_true", default=False)
     p.add_argument("--w-rot",   type=float, default=1.0)
     p.add_argument("--w-trans", type=float, default=1.0)
@@ -509,6 +540,8 @@ def parse_args():
     p.add_argument("--save-path", default="output_checkpoints/20260707_pose_sitr")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--resume", default=None)
+    p.add_argument("--no-cache-calibration", action="store_true",
+                   help="Disable calibration encoder cache")
     return p.parse_args()
 
 
@@ -539,7 +572,8 @@ def main():
         args.data_path, args.mesh_dir, img_xform,
         calibration_config=args.calibration_config,
         split="val", val_every=args.val_every,
-        center_crop=args.center_crop)
+        center_crop=args.center_crop,
+        shared_obj_map=train_ds._obj_to_id)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
@@ -562,6 +596,15 @@ def main():
         p.requires_grad = False
     print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())/1e6:.1f}M (frozen)")
 
+    # ── calibration cache ──────────────────────────────────────────────────
+    if not args.no_cache_calibration and args.calibration_config > 0:
+        sample0 = train_ds[0]
+        calib_tensor = sample0["calibration"].unsqueeze(0).to(device)
+        encoder.cache_calibration(calib_tensor)
+        print(f"  Calibration cache: c_enc shape={encoder._calib_cache.shape}")
+        train_ds.skip_calibration = True
+        val_ds.skip_calibration = True
+
     # ── pose head ───────────────────────────────────────────────────────────
     pose_head = PoseHead(
         dim=768, hidden_dim=args.hidden_dim, dropout=args.dropout,
@@ -569,6 +612,13 @@ def main():
     ).to(device)
     print(f"  Pose head: {sum(p.numel() for p in pose_head.parameters())/1e6:.1f}M "
           f"(mode={args.pose_mode}, bins={args.rot_num_bins})")
+
+    # ── object embedding (optional, matches VisTacFusion) ────────────────
+    obj_embedding = None
+    if args.use_obj_emb:
+        num_obj = max(args.num_objects, len(train_ds.objects))
+        obj_embedding = nn.Embedding(num_obj, 768).to(device)
+        print(f"  Object embedding: {num_obj} classes, dim=768")
 
     # ── optimizer ───────────────────────────────────────────────────────────
     pose_loss_fn = PoseLoss(args.pose_mode, args.rot_num_bins)
@@ -579,6 +629,8 @@ def main():
         print("  Kendall uncertainty weighting: ON (rot + trans)")
 
     params = list(pose_head.parameters())
+    if obj_embedding is not None:
+        params.extend(obj_embedding.parameters())
     if log_vars is not None:
         params.append(log_vars)
 
@@ -603,6 +655,8 @@ def main():
         best_val_loss = ck.get("best_val_loss", float("inf"))
         if "log_vars" in ck and log_vars is not None:
             log_vars.data = ck["log_vars"]
+        if "obj_embedding" in ck and obj_embedding is not None:
+            obj_embedding.load_state_dict(ck["obj_embedding"])
         print(f"  Resumed from epoch {start_epoch}")
 
     # ── training loop ───────────────────────────────────────────────────────
@@ -619,8 +673,9 @@ def main():
     print("\n" + "=" * 60)
     print(f"Pose Training | encoder=SITR  mode={args.pose_mode}  bins={args.rot_num_bins}")
     print(f"  bs={args.batch_size}  lr={args.lr}  dropout={args.dropout}")
+    obj_str = f"  obj_emb={args.use_obj_emb}" if args.use_obj_emb else ""
     loss_str = "Kendall (learned)" if args.kendall else f"w_rot={args.w_rot} w_trans={args.w_trans}"
-    print(f"  loss: {loss_str}  early_stop={args.early_stop}  device={args.device}")
+    print(f"  loss: {loss_str}  early_stop={args.early_stop}  device={args.device}{obj_str}")
     print("=" * 60)
 
     for epoch in range(start_epoch, args.epochs):
@@ -630,11 +685,13 @@ def main():
         train_loss, l_rot, l_trans = train_one_epoch(
             encoder, pose_head, train_loader, optimizer, scaler,
             pose_loss_fn, args.w_rot, args.w_trans,
-            device, args.amp, epoch, log_vars=log_vars)
+            device, args.amp, epoch, log_vars=log_vars,
+            obj_embedding=obj_embedding)
 
         val_loss, v_rot, v_trans, rot_err_deg, trans_err = validate(
             encoder, pose_head, val_loader, pose_loss_fn,
-            args.w_rot, args.w_trans, device, args.amp, log_vars=log_vars)
+            args.w_rot, args.w_trans, device, args.amp, log_vars=log_vars,
+            obj_embedding=obj_embedding)
 
         scheduler.step(val_loss)
 
@@ -665,6 +722,8 @@ def main():
             }
             if log_vars is not None:
                 d["log_vars"] = log_vars.data
+            if obj_embedding is not None:
+                d["obj_embedding"] = obj_embedding.state_dict()
             torch.save(d, path)
 
         if val_loss < best_val_loss:

@@ -310,6 +310,8 @@ def parse_args():
     p.add_argument("--num-samples", type=int, default=None)
     p.add_argument("--no-cache",    action="store_true",
                    help="Disable RAM cache")
+    p.add_argument("--no-cache-calibration", action="store_true",
+                   help="Disable calibration encoder cache (recompute c_patch_embed every batch)")
 
     # encoder
     p.add_argument("--encoder",            type=str, default="sitr",
@@ -552,6 +554,19 @@ def main():
     print(f"  Encoder: {encoder_params / 1e6:.1f}M ({frozen_tag})")
     print(f"  Decoder: {decoder_params / 1e6:.1f}M (trainable)")
     print(f"  Total trainable: {trainable / 1e6:.1f}M")
+
+    # ── calibration cache ─────────────────────────────────────────────────────
+    if args.encoder == "sitr" and not args.no_cache_calibration and args.calibration_config > 0:
+        calib_tensor = sample0["calibration"].unsqueeze(0).to(device)
+        model.encoder.cache_calibration(calib_tensor)
+        print(f"  Calibration cache: c_enc shape={model.encoder.sitr._calib_cache.shape}")
+        def _set_skip(ds):
+            if hasattr(ds, 'dataset'):
+                _set_skip(ds.dataset)
+            elif hasattr(ds, 'skip_calibration'):
+                ds.skip_calibration = True
+        _set_skip(train_ds)
+        _set_skip(val_ds_noaug)
 
     # ── optimiser ─────────────────────────────────────────────────────────────
     depth_criterion  = nn.MSELoss()

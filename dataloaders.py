@@ -412,6 +412,7 @@ class sim_dataset_nested(Dataset):
         self.sendTwo = sendTwo
         self.norm_suffix = '_gt' if use_gt_norm else ''
         self._calib_cache = {}   # 每個 unit 的 (ref, 18×calib) 原始影像，避免每 sample 重讀
+        self.skip_calibration = False
 
         if calibration_config == 0: self.calib_list = []
         elif calibration_config == 4: self.calib_list = [1,3,7,9]
@@ -484,7 +485,12 @@ class sim_dataset_nested(Dataset):
 
         sample = np.array(Image.open(osp.join(unit, 'samples', '{0:04}.png'.format(sample_idx))))
 
-        if self.raw_input:
+        if self.skip_calibration:
+            sample_f = sample.astype(np.float32)
+            if not self.raw_input:
+                sample_f = sample_f - ref_img.astype(np.float32)
+            calib_imgs = []
+        elif self.raw_input:
             # Raw mode: no background subtraction, ref included in calibration
             sample_f = sample.astype(np.float32)
             all_imgs = [ref_img.astype(np.float32)] + [c.astype(np.float32) for c in calib_raw]
