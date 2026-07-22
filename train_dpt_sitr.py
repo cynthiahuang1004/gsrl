@@ -58,7 +58,7 @@ class CachedDataset(Dataset):
                                 num_workers=num_workers, prefetch_factor=2,
                                 persistent_workers=False)
             for batch in tqdm(loader, ncols=80):
-                self.cache.append({k: v.squeeze(0) for k, v in batch.items()})
+                self.cache.append({k: v.squeeze(0).clone() for k, v in batch.items()})
         else:
             for i in tqdm(range(len(dataset)), ncols=80):
                 self.cache.append(dataset[i])
@@ -491,7 +491,9 @@ def main():
 
     # ── workers ────────────────────────────────────────────────────────────
     train_workers = args.num_workers
-    val_workers = args.num_workers
+
+    if not args.no_cache:
+        val_ds_noaug = CachedDataset(val_ds_noaug, desc="Caching val", num_workers=args.num_workers)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -502,9 +504,7 @@ def main():
     )
     val_loader = DataLoader(
         val_ds_noaug, batch_size=args.batch_size, shuffle=False,
-        num_workers=val_workers, pin_memory=(val_workers > 0 and not args.no_pin_memory),
-        persistent_workers=(val_workers > 0),
-        prefetch_factor=(4 if val_workers > 0 else None),
+        num_workers=0, pin_memory=True,
     )
     print(f"  train: {len(train_ds):,}   val: {len(val_ds_noaug):,}")
 
@@ -566,7 +566,6 @@ def main():
             elif hasattr(ds, 'skip_calibration'):
                 ds.skip_calibration = True
         _set_skip(train_ds)
-        _set_skip(val_ds_noaug)
 
     # ── optimiser ─────────────────────────────────────────────────────────────
     depth_criterion  = nn.MSELoss()

@@ -41,6 +41,29 @@ from dataloaders import sample_mu, sample_std, norm_mu, norm_std
 from models.networks import SITR_base
 
 
+class CachedDataset(Dataset):
+    def __init__(self, dataset, desc="Caching", num_workers=8):
+        self.cache = []
+        print(f"  {desc}: loading {len(dataset):,} samples into RAM … (workers={num_workers})")
+        t0 = time.time()
+        if num_workers > 0:
+            loader = DataLoader(dataset, batch_size=1, shuffle=False,
+                                num_workers=num_workers, prefetch_factor=2,
+                                persistent_workers=False)
+            for batch in tqdm(loader, ncols=80):
+                self.cache.append({k: v.squeeze(0).clone() for k, v in batch.items()})
+        else:
+            for i in tqdm(range(len(dataset)), ncols=80):
+                self.cache.append(dataset[i])
+        print(f"  Done in {time.time() - t0:.1f}s")
+
+    def __len__(self):
+        return len(self.cache)
+
+    def __getitem__(self, idx):
+        return self.cache[idx]
+
+
 # ── Pose Head (matches VisTacFusion) ────────────────────────────────────────
 
 class PoseHead(nn.Module):
@@ -575,14 +598,14 @@ def main():
         center_crop=args.center_crop,
         shared_obj_map=train_ds._obj_to_id)
 
+    val_ds = CachedDataset(val_ds, desc="Caching val", num_workers=args.num_workers)
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
                               persistent_workers=(args.num_workers > 0),
                               prefetch_factor=4 if args.num_workers > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True,
-                            persistent_workers=(args.num_workers > 0),
-                            prefetch_factor=4 if args.num_workers > 0 else None)
+                            num_workers=0, pin_memory=True)
 
     # ── encoder (frozen) ────────────────────────────────────────────────────
     print(f"Loading SITR encoder from {args.encoder_weights}...")
@@ -603,7 +626,6 @@ def main():
         encoder.cache_calibration(calib_tensor)
         print(f"  Calibration cache: c_enc shape={encoder._calib_cache.shape}")
         train_ds.skip_calibration = True
-        val_ds.skip_calibration = True
 
     # ── pose head ───────────────────────────────────────────────────────────
     pose_head = PoseHead(

@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import matplotlib
@@ -317,14 +317,15 @@ def main():
         center_crop=args.center_crop,
         shared_obj_map=train_ds._obj_to_id)
 
+    from train_pose_sitr import CachedDataset
+    val_ds = CachedDataset(val_ds, desc="Caching val", num_workers=args.num_workers)
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,
                               persistent_workers=(args.num_workers > 0),
                               prefetch_factor=4 if args.num_workers > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True,
-                            persistent_workers=(args.num_workers > 0),
-                            prefetch_factor=4 if args.num_workers > 0 else None)
+                            num_workers=0, pin_memory=True)
 
     # ── encoder (frozen) ────────────────────────────────────────────────────
     print(f"\nBuilding DINOv3 encoder ({args.dinov3_model})...")

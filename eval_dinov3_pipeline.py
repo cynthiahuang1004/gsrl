@@ -16,6 +16,7 @@ import os.path as osp
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import autocast
 from torch.utils.data import DataLoader
@@ -106,6 +107,7 @@ def main():
     # ── Pose encoder + head ────────────────────────────────────────────────
     pose_head = None
     pose_encoder = None
+    obj_embedding = None
     if args.pose_weights:
         print(f"Loading pose head from {args.pose_weights}...")
         pose_ck = torch.load(args.pose_weights, map_location="cpu", weights_only=False)
@@ -127,6 +129,13 @@ def main():
         pose_head.load_state_dict(pose_ck["pose_head"])
         pose_head.eval()
 
+        if "obj_embedding" in pose_ck:
+            num_obj, emb_dim = pose_ck["obj_embedding"]["weight"].shape
+            obj_embedding = nn.Embedding(num_obj, emb_dim)
+            obj_embedding.load_state_dict(pose_ck["obj_embedding"])
+            obj_embedding = obj_embedding.to(device).eval()
+            print(f"  Object embedding loaded: {obj_embedding.num_embeddings} classes")
+
     # ── Vis indices (one per object) ───────────────────────────────────────
     obj_vis_indices = {}
     for vi in val_idx:
@@ -140,6 +149,7 @@ def main():
 
     # ── Pose GT ────────────────────────────────────────────────────────────
     pose_gt_map = {}
+    pose_obj_map = {}
     if pose_head is not None:
         pose_ds = PoseDataset(
             args.data_path, args.mesh_dir, img_xform,
@@ -147,7 +157,10 @@ def main():
             split="val", val_every=args.val_every,
             center_crop=args.center_crop)
         for pi in range(len(pose_ds)):
-            pose_gt_map[pi] = pose_ds[pi]["pose"].numpy()
+            sample = pose_ds[pi]
+            pose_gt_map[pi] = sample["pose"].numpy()
+            if obj_embedding is not None:
+                pose_obj_map[pi] = sample["object"]
 
     # ── Eval loop ──────────────────────────────────────────────────────────
     print("\nEvaluating (depth + normal + pose, batched)...")
@@ -175,6 +188,11 @@ def main():
             if pose_head is not None and pose_encoder is not None:
                 enc_out = pose_encoder(imgs)
                 latent = enc_out["latent"]
+                if obj_embedding is not None:
+                    obj_ids = torch.tensor(
+                        [pose_obj_map[sample_counter + j] for j in range(B)],
+                        device=device)
+                    latent = latent + obj_embedding(obj_ids).unsqueeze(1)
                 pred_pose = pose_head(latent[:, 0, :], latent[:, 1:, :])
                 pred_se2 = pred_pose["se2"].float().cpu().numpy()
 
