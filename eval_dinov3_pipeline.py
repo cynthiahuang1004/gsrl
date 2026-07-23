@@ -14,6 +14,8 @@ import argparse
 import os
 import os.path as osp
 
+import json
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -147,7 +149,7 @@ def main():
     vis_global_set = set(obj_vis_indices.values())
     print(f"  Will visualize {len(vis_global_set)} samples (1 per object)")
 
-    # ── Pose GT ────────────────────────────────────────────────────────────
+    # ── Pose GT (lightweight — only reads pose json, no images) ─────────────
     pose_gt_map = {}
     pose_obj_map = {}
     if pose_head is not None:
@@ -157,10 +159,20 @@ def main():
             split="val", val_every=args.val_every,
             center_crop=args.center_crop)
         for pi in range(len(pose_ds)):
-            sample = pose_ds[pi]
-            pose_gt_map[pi] = sample["pose"].numpy()
+            unit, sample_idx = pose_ds.samples[pi]
+            meta = pose_ds.unit_meta[unit]
+            with open(osp.join(unit, "raw_data", f"{sample_idx:04d}_pose.json")) as f:
+                pdata = json.load(f)
+            delta_rz = pdata["rotation_euler"][2] - meta["rz0"]
+            half = meta["half"]
+            cos_rz, sin_rz = math.cos(delta_rz), math.sin(delta_rz)
+            sx, sy = pdata["sample_x"], pdata["sample_y"]
+            x_norm = (cos_rz * sx - sin_rz * sy) / max(half, 1e-8)
+            y_norm = (sin_rz * sx + cos_rz * sy) / max(half, 1e-8)
+            pose_gt_map[pi] = np.array([cos_rz, sin_rz, x_norm, y_norm], dtype=np.float32)
             if obj_embedding is not None:
-                pose_obj_map[pi] = sample["object"]
+                obj_name = osp.basename(osp.dirname(osp.dirname(unit)))
+                pose_obj_map[pi] = pose_ds._obj_to_id[obj_name]
 
     # ── Eval loop ──────────────────────────────────────────────────────────
     print("\nEvaluating (depth + normal + pose, batched)...")
