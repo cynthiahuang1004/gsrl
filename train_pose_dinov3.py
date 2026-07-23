@@ -284,6 +284,10 @@ def parse_args():
     p.add_argument("--save-path", default="output_checkpoints/pose_dinov3")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--resume", default=None)
+    p.add_argument("--real-path", default=None,
+                   help="Path to real data for sim+real co-training")
+    p.add_argument("--real-oversample", type=int, default=0,
+                   help="Oversample factor for real data (0=auto)")
     return p.parse_args()
 
 
@@ -316,6 +320,28 @@ def main():
         raw_input=args.raw_input,
         center_crop=args.center_crop,
         shared_obj_map=train_ds._obj_to_id)
+
+    if args.real_path:
+        from torch.utils.data import ConcatDataset
+        real_train = PoseDataset(
+            args.real_path, args.mesh_dir, img_xform,
+            calibration_config=0, raw_input=True,
+            split="train", val_every=args.val_every,
+            center_crop=args.center_crop,
+            shared_obj_map=train_ds._obj_to_id)
+        real_val = PoseDataset(
+            args.real_path, args.mesh_dir, img_xform,
+            calibration_config=0, raw_input=True,
+            split="val", val_every=args.val_every,
+            center_crop=args.center_crop,
+            shared_obj_map=train_ds._obj_to_id)
+        oversample = args.real_oversample
+        if oversample <= 0:
+            oversample = max(1, len(train_ds) // max(1, len(real_train)) // 2)
+        train_ds = ConcatDataset([train_ds] + [real_train] * oversample)
+        val_ds = real_val
+        print(f"  Co-training: sim + real×{oversample} = {len(train_ds)} train, "
+              f"val={len(val_ds)} (real only)")
 
     from train_pose_sitr import CachedDataset
     val_ds = CachedDataset(val_ds, desc="Caching val", num_workers=args.num_workers)

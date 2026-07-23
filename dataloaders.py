@@ -473,9 +473,14 @@ class sim_dataset_nested(Dataset):
         cached = self._calib_cache.get(unit)
         if cached is None:
             cal_dir = osp.join(unit, 'calibration')
-            ref = np.array(Image.open(osp.join(cal_dir, '0000.png')))
-            calib = [np.array(Image.open(osp.join(cal_dir, '{0:04}.png'.format(i))))
-                     for i in range(1, 19)]
+            ref_path = osp.join(cal_dir, '0000.png')
+            if osp.exists(ref_path):
+                ref = np.array(Image.open(ref_path))
+                calib = [np.array(Image.open(osp.join(cal_dir, '{0:04}.png'.format(i))))
+                         for i in range(1, 19)]
+            else:
+                ref = None
+                calib = []
             cached = (ref, calib)
             self._calib_cache[unit] = cached
         return cached
@@ -485,9 +490,9 @@ class sim_dataset_nested(Dataset):
 
         sample = np.array(Image.open(osp.join(unit, 'samples', '{0:04}.png'.format(sample_idx))))
 
-        if self.skip_calibration:
+        if self.skip_calibration or ref_img is None:
             sample_f = sample.astype(np.float32)
-            if not self.raw_input:
+            if not self.raw_input and ref_img is not None:
                 sample_f = sample_f - ref_img.astype(np.float32)
             calib_imgs = []
         elif self.raw_input:
@@ -520,10 +525,16 @@ class sim_dataset_nested(Dataset):
                 npy_path = osp.join(unit, 'raw_data',
                                     '{0:04}{1}.npy'.format(sample_idx, self.norm_suffix))
                 depth = np.load(npy_path).astype(np.float32)
+            except Exception:
+                pass
+            try:
                 norm_path = osp.join(unit, 'norms', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))
                 normal = np.array(Image.open(norm_path), dtype=np.float32)
             except Exception:
-                pass
+                if depth is not None:
+                    pixel_size = self.gel_view_m * FIXED_CROP / depth.shape[0]
+                    normal_raw = depth_to_normal(depth, pixel_size, pixel_size)
+                    normal = ((normal_raw + 1.0) * 127.5).clip(0, 255).astype(np.float32)
         else:
             try:
                 dmap_path = osp.join(unit, 'dmaps', '{0:04}{1}.png'.format(sample_idx, self.norm_suffix))

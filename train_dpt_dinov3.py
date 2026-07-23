@@ -232,6 +232,10 @@ def parse_args():
     p.add_argument("--save-path", default="output_checkpoints/dpt_dinov3")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--resume", default=None)
+    p.add_argument("--real-path", default=None,
+                   help="Path to real data for sim+real co-training")
+    p.add_argument("--real-oversample", type=int, default=0,
+                   help="Oversample factor for real data (0=auto)")
     return p.parse_args()
 
 
@@ -275,6 +279,30 @@ def main():
     val_ds   = torch.utils.data.Subset(full_noaug, val_idx)
     print(f"  Per-session split: val_every={args.val_every} "
           f"({len(val_idx)}/{len(all_idx)} val, {len(train_idx)}/{len(all_idx)} train)")
+
+    if args.real_path:
+        from torch.utils.data import ConcatDataset
+        real_ds = sim_dataset_nested(
+            path=args.real_path, augment=False,
+            transforms=img_xform, dmap_transforms=dmap_xform, norm_transforms=norm_xform,
+            calibration_config=0, sendTwo=False,
+            use_gt_norm=False, raw_input=True,
+            center_crop=args.center_crop,
+            depth_from_npy=True,
+        )
+        spu_r = real_ds.samples_per_unit
+        all_r = list(range(len(real_ds)))
+        real_train_idx = [i for i in all_r if (i % spu_r) % args.val_every != 0]
+        real_val_idx   = [i for i in all_r if (i % spu_r) % args.val_every == 0]
+        real_train = torch.utils.data.Subset(real_ds, real_train_idx)
+        real_val   = torch.utils.data.Subset(real_ds, real_val_idx)
+        oversample = args.real_oversample
+        if oversample <= 0:
+            oversample = max(1, len(train_ds) // max(1, len(real_train)) // 2)
+        train_ds = ConcatDataset([train_ds] + [real_train] * oversample)
+        val_ds = real_val
+        print(f"  Co-training: sim + real×{oversample} = {len(train_ds)} train, "
+              f"val={len(val_ds)} (real only)")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True,

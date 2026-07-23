@@ -205,13 +205,8 @@ class PoseDataset(Dataset):
             if info is None:
                 continue
 
-            session_dir = osp.dirname(unit)
-            with open(osp.join(session_dir, "session.json")) as f:
-                sess = json.load(f)
-            delta_rz = sess["base_rotation"][2] - info["rz0"]
-
             self.unit_meta[unit] = {
-                "delta_rz": delta_rz,
+                "rz0": info["rz0"],
                 "half": info["half"],
             }
 
@@ -264,9 +259,14 @@ class PoseDataset(Dataset):
         cached = self._calib_cache.get(unit)
         if cached is None:
             cal_dir = osp.join(unit, "calibration")
-            ref = np.array(Image.open(osp.join(cal_dir, "0000.png")))
-            calib = [np.array(Image.open(osp.join(cal_dir, f"{i:04d}.png")))
-                     for i in range(1, 19)]
+            ref_path = osp.join(cal_dir, "0000.png")
+            if osp.exists(ref_path):
+                ref = np.array(Image.open(ref_path))
+                calib = [np.array(Image.open(osp.join(cal_dir, f"{i:04d}.png")))
+                         for i in range(1, 19)]
+            else:
+                ref = None
+                calib = []
             cached = (ref, calib)
             self._calib_cache[unit] = cached
         return cached
@@ -281,10 +281,10 @@ class PoseDataset(Dataset):
         sample = np.array(Image.open(
             osp.join(unit, "samples", f"{sample_idx:04d}.png")))
 
-        if self.skip_calibration:
-            ref_img, _ = self._get_calib(unit)
+        ref_img, calib_raw = self._get_calib(unit)
+        if self.skip_calibration or ref_img is None:
             sample_f = sample.astype(np.float32)
-            if not self.raw_input:
+            if not self.raw_input and ref_img is not None:
                 sample_f = sample_f - ref_img.astype(np.float32)
             calib_imgs = []
         elif self.raw_input:
@@ -321,11 +321,11 @@ class PoseDataset(Dataset):
         sample_t = self.img_xform(sample_f)
         calib_t = torch.cat([self.img_xform(c) for c in calib_imgs]) if calib_imgs else torch.empty(0)
 
-        # Pose label (VisTacFusion convention)
+        # Pose label (VisTacFusion convention: per-sample rotation_euler)
         with open(osp.join(unit, "raw_data", f"{sample_idx:04d}_pose.json")) as f:
             pdata = json.load(f)
-        delta_rz = meta["delta_rz"]
         half = meta["half"]
+        delta_rz = pdata["rotation_euler"][2] - meta["rz0"]
         cos_rz, sin_rz = math.cos(delta_rz), math.sin(delta_rz)
         sx, sy = pdata["sample_x"], pdata["sample_y"]
         x_norm = (cos_rz * sx - sin_rz * sy) / max(half, 1e-8)
@@ -565,6 +565,10 @@ def parse_args():
     p.add_argument("--resume", default=None)
     p.add_argument("--no-cache-calibration", action="store_true",
                    help="Disable calibration encoder cache")
+    p.add_argument("--real-path", default=None,
+                   help="Path to real data for sim+real co-training")
+    p.add_argument("--real-oversample", type=int, default=0,
+                   help="Oversample factor for real data (0=auto)")
     return p.parse_args()
 
 
@@ -597,6 +601,30 @@ def main():
         split="val", val_every=args.val_every,
         center_crop=args.center_crop,
         shared_obj_map=train_ds._obj_to_id)
+
+    # ── sim+real co-training ──────────────────────────────────────────────
+    if args.real_path:
+        from torch.utils.data import ConcatDataset
+        real_train = PoseDataset(
+            args.real_path, args.mesh_dir, img_xform,
+            calibration_config=0, raw_input=True,
+            split="train", val_every=args.val_every,
+            center_crop=args.center_crop,
+            shared_obj_map=train_ds._obj_to_id)
+        real_val = PoseDataset(
+            args.real_path, args.mesh_dir, img_xform,
+            calibration_config=0, raw_input=True,
+            split="val", val_every=args.val_every,
+            center_crop=args.center_crop,
+            shared_obj_map=train_ds._obj_to_id)
+        oversample = args.real_oversample
+        if oversample <= 0:
+            oversample = max(1, len(train_ds) // max(1, len(real_train)) // 2)
+        train_ds = ConcatDataset([train_ds] + [real_train] * oversample)
+        val_ds = real_val
+        print(f"  Co-training: sim={len(train_ds) - len(real_train)*oversample} + "
+              f"real={len(real_train)}×{oversample} = {len(train_ds)} train, "
+              f"val={len(val_ds)} (real only)")
 
     val_ds = CachedDataset(val_ds, desc="Caching val", num_workers=args.num_workers)
 
