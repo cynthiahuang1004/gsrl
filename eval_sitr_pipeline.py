@@ -281,6 +281,12 @@ def main():
     model.decoder.load_state_dict(dpt_ck["decoder"])
     model.eval()
 
+    if args.calibration_config > 0:
+        sample0 = val_ds[0]
+        calib_tensor = sample0["calibration"].unsqueeze(0).to(device)
+        model.encoder.cache_calibration(calib_tensor)
+        print(f"  Calibration cache: shape={model.encoder.sitr._calib_cache.shape}")
+
     # ── Load pose head ──────────────────────────────────────────────────────
     pose_head = None
     obj_embedding = None

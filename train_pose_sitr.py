@@ -538,6 +538,7 @@ def parse_args():
     p.add_argument("--tactile-augment", action="store_true", default=False)
     p.add_argument("--gel-spin-deg", type=float, default=0.0)
     p.add_argument("--center-crop", action="store_true", default=False)
+    p.add_argument("--raw-input", action="store_true", default=False)
     p.add_argument("--use-obj-emb", action="store_true", default=True,
                    help="Add object embedding conditioning (matches VisTacFusion)")
     p.add_argument("--no-obj-emb", dest="use_obj_emb", action="store_false")
@@ -581,7 +582,7 @@ def main():
 
     import torchvision.transforms as T
     from dataloaders import imagenet_mu, imagenet_std
-    if args.calibration_config == 0:
+    if args.raw_input or args.calibration_config == 0:
         img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=imagenet_mu, std=imagenet_std)])
     else:
         img_xform = T.Compose([T.ToTensor(), T.Normalize(mean=sample_mu, std=sample_std)])
@@ -591,6 +592,7 @@ def main():
     train_ds = PoseDataset(
         args.data_path, args.mesh_dir, img_xform,
         calibration_config=args.calibration_config,
+        raw_input=args.raw_input,
         split="train", val_every=args.val_every,
         gel_spin_max_deg=args.gel_spin_deg,
         center_crop=args.center_crop,
@@ -598,6 +600,7 @@ def main():
     val_ds = PoseDataset(
         args.data_path, args.mesh_dir, img_xform,
         calibration_config=args.calibration_config,
+        raw_input=args.raw_input,
         split="val", val_every=args.val_every,
         center_crop=args.center_crop,
         shared_obj_map=train_ds._obj_to_id)
